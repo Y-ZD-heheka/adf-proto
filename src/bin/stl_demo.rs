@@ -175,15 +175,28 @@ fn main() {
     }
 
     // ── 7) Surface Nets 提取 + STL 导出 + 体积对账 ──
-    let h_ext = h_min * 2.0;
+    // 提取格宽倍率:环境变量可覆盖(实验用;默认 2×h_min)
+    let hf_mult: Real = std::env::var("ADF_H_EXT").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
+    let h_ext = h_min * hf_mult;
     let t = Instant::now();
     let mesh = nets::extract_uniform(&adf, h_ext);
     println!(
-        "[nets] h={h_ext:.4} 提取 {:?} | 顶点 {} 三角 {}",
+        "[nets] h={h_ext:.4}({hf_mult}×h_min) 提取 {:?} | 顶点 {} 三角 {}",
         t.elapsed(),
         mesh.verts.len(),
         mesh.tris.len()
     );
+    {
+        let (open, nonman, comps) = mesh.edge_stats();
+        println!(
+            "[nets.topology] 开放边(洞) {open} | 非流形边 {nonman} | 连通分量 {comps}{}",
+            match (open, nonman) {
+                (0, 0) => " → 闭合流形(可打印)",
+                (0, _) => " → 闭合但含非流形边(切片软件一般可容错)",
+                _ => " → **有开口**",
+            }
+        );
+    }
     let vol_out = mesh.signed_volume().abs();
     let dev = if vol_in > 0.0 { (vol_out - vol_in) / vol_in * 100.0 } else { 0.0 };
     println!(

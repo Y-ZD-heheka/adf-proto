@@ -6,13 +6,15 @@
 ## 构建 / 测试 / 演示
 
 ```bash
-cargo test --release          # 23/23
+cargo test --release          # 24/24
 cargo run --release --bin stl-demo                                    # 桌腿固定器
 cargo run --release --bin stl-demo -- stls/Turbo_Impeller.stl 0.2     # 涡轮叶轮压测
 
 # 性能定位工具
 cargo run --release --example bench_bvh      # 最近点查询:深度/种子/线程扩展性
 cargo run --release --example bench_redist   # 重距离化:EDT vs 八序扫掠
+cargo run --release --example check_mesh      # 导出网格体检:分量/碎屑/绕向
+cargo run --release --example probe_field     # 场体检:体积/表面邻域/顶点偏离
 ```
 
 ## 性能基线(16 物理核 / 24 逻辑核,Raptor Lake)
@@ -23,8 +25,8 @@ cargo run --release --example bench_redist   # 重距离化:EDT vs 八序扫掠
 | 构建 | 0.95s | 0.77s |
 | 切削 ×2(并行) | 0.06 / 0.12s | 0.13 / 0.07s |
 | 重距离化 | 0.49s | 0.18s |
-| 提取+STL | 0.51s | 0.09s |
-| **全管线** | **~2.3s** | **~1.5s** |
+| 提取+STL(含绕向统一) | 0.90s | 0.16s |
+| **全管线** | **~2.7s** | **~1.6s** |
 
 历史对照(同一台机器):初版 13.3s / 137s;BVH 叶判别修正 7.8s / 2.5s;提取并行 + 热路径去开销
 2.4s / 1.8s;去掉容器与 libm 开销后 2.2s / 1.5s。七处收益分别来自:①BVH 叶判别修正(P1),②重距离化改精确 EDT(P2),
