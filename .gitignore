@@ -6,6 +6,8 @@ rl1.txt
 rw1.txt
 adf_out.stl
 stl_out.stl
+# VTune 采集结果目录
+vtune_*/
 # 测试资产仅保留 demo/测试引用的两件;其余 STL 来自 CNCSIM,体积大不入库
 stls/*
 !stls/桌腿固定器.stl

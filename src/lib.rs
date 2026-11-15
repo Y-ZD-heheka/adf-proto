@@ -394,7 +394,7 @@ fn edt_1d(sq: &[f64], st: &[u32]) -> (Vec<f64>, Vec<u32>) {
     let n = sq.len();
     let mut out = vec![f64::INFINITY; n];
     let mut out_arg = vec![u32::MAX; n];
-    let Some(mut f0) = (0..n).find(|&q| sq[q].is_finite()) else {
+    let Some(f0) = (0..n).find(|&q| sq[q].is_finite()) else {
         return (out, out_arg); // 整线无站
     };
     let mut v = vec![0usize; n]; // 包络抛物线顶(格位置,均为有限站)
@@ -425,7 +425,7 @@ fn edt_1d(sq: &[f64], st: &[u32]) -> (Vec<f64>, Vec<u32>) {
         while z[e + 1] < q as f64 {
             e += 1;
         }
-        let dx = (q as f64 - v[e] as f64);
+        let dx = q as f64 - v[e] as f64;
         out[q] = sq[v[e]] + dx * dx;
         out_arg[q] = st[v[e]];
     }
@@ -705,6 +705,11 @@ pub struct RedistStats {
     pub interface_leaves: u64,
     pub grid_n: [usize; 3],
     pub corrected: u64,
+    /// 分段耗时(性能定位用):符号场初值 / 棱种子 / 松弛扫掠 / 写回
+    pub t_eval: std::time::Duration,
+    pub t_seed: std::time::Duration,
+    pub t_relax: std::time::Duration,
+    pub t_write: std::time::Duration,
 }
 
 #[inline]
@@ -808,6 +813,174 @@ fn eikonal_update(a: &mut [f32; 3], h: f32) -> f32 {
         }
     }
     t
+}
+
+/// 并行度:按可用逻辑核数。注意本机 16 物理 / 24 逻辑,BVH 查询实测 16 工人
+/// 已略优于 24(超线程在 Cache 密集遍历上互相挤占);此处取逻辑核数保持不变,
+/// 需要时再按阶段细分。
+fn nthreads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).max(1)
+}
+
+/// 串行八序 Gauss-Seidel 松弛(**参考实现**,供并行版逐位对账;不参与生产路径)。
+pub fn eikonal_sweep_serial(d: &mut [f32], gn: [usize; 3], hf: f32, rounds: u32) {
+    let (nx, ny, nz) = (gn[0], gn[1], gn[2]);
+    let inf = f32::INFINITY;
+    let mut cand = [inf; 3];
+    for r in 0..rounds {
+        let (fx, fy, fz) = (r & 1 == 0, r & 2 == 0, r & 4 == 0);
+        for kz in 0..nz {
+            let k = if fz { kz } else { nz - 1 - kz };
+            for jy in 0..ny {
+                let j = if fy { jy } else { ny - 1 - jy };
+                for ix in 0..nx {
+                    let i = if fx { ix } else { nx - 1 - ix };
+                    let c = (k * ny + j) * nx + i;
+                    let cur = d[c];
+                    if cur <= hf {
+                        continue;
+                    }
+                    // 每轴取两侧邻居的较小值(Godunov 的 per-axis 候选)
+                    cand[0] = inf;
+                    if i > 0 { cand[0] = cand[0].min(d[c - 1]); }
+                    if i + 1 < nx { cand[0] = cand[0].min(d[c + 1]); }
+                    cand[1] = inf;
+                    if j > 0 { cand[1] = cand[1].min(d[c - nx]); }
+                    if j + 1 < ny { cand[1] = cand[1].min(d[c + nx]); }
+                    cand[2] = inf;
+                    if k > 0 { cand[2] = cand[2].min(d[c - nx * ny]); }
+                    if k + 1 < nz { cand[2] = cand[2].min(d[c + nx * ny]); }
+                    let t = eikonal_update(&mut cand, hf);
+                    if t < cur {
+                        d[c] = t;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 复用缓冲的 1D EDT(**与 edt_1d 算法完全一致**,只是省掉每线 4 次分配)。
+/// 不产出 arg(重距离化只要距离)。
+fn edt_1d_into(sq: &[f64], out: &mut [f64], v: &mut [usize], z: &mut [f64]) {
+    let n = sq.len();
+    out[..n].fill(f64::INFINITY);
+    let Some(f0) = (0..n).find(|&q| sq[q].is_finite()) else {
+        return; // 整线无站
+    };
+    let mut k = 0usize;
+    v[0] = f0;
+    z[0] = f64::NEG_INFINITY;
+    z[1] = f64::INFINITY;
+    let inter = |q: usize, pk: usize| {
+        ((sq[q] + (q * q) as f64) - (sq[pk] + (pk * pk) as f64)) / (2.0 * (q - pk) as f64)
+    };
+    for q in (f0 + 1)..n {
+        if !sq[q].is_finite() {
+            continue;
+        }
+        let mut s = inter(q, v[k]);
+        while s <= z[k] {
+            k -= 1;
+            s = inter(q, v[k]);
+        }
+        k += 1;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = f64::INFINITY;
+    }
+    let mut e = 0usize;
+    for q in 0..n {
+        while z[e + 1] < q as f64 {
+            e += 1;
+        }
+        let dx = q as f64 - v[e] as f64;
+        out[q] = sq[v[e]] + dx * dx;
+    }
+}
+
+/// 矩形网格单轴 1D EDT,按线并行。
+/// **安全性**:同一轴上的不同线,其元素索引集合两两不交(轴分解的定义),
+/// 且 `l ≡ w (mod nworkers)` 保证每条线只归一个工人 ⟹ 无别名写。
+/// **确定性**:每条线的输出只由该线输入决定,与线序、工人数无关 ⟹ 逐位可复现。
+fn edt_axis_par(d: &mut [f32], gn: [usize; 3], axis: usize, nt: usize) {
+    let (nx, ny, nz) = (gn[0], gn[1], gn[2]);
+    let plane = nx * ny;
+    let (nline, len, step) = match axis {
+        0 => (ny * nz, nx, 1usize),      // 线沿 i:l = k*ny + j
+        1 => (nx * nz, ny, nx),          // 线沿 j:l = k*nx + i
+        _ => (nx * ny, nz, plane),       // 线沿 k:l = j*nx + i
+    };
+    if nline == 0 || len == 0 {
+        return;
+    }
+    let base_of = move |l: usize| -> usize {
+        match axis {
+            0 => l * nx,
+            1 => (l / nx) * plane + (l % nx),
+            _ => l,
+        }
+    };
+    let ptr = d.as_mut_ptr() as usize; // 仅用于跨工人共享;写集合互斥见上
+    let nworkers = nt.clamp(1, nline);
+    std::thread::scope(|sc| {
+        for w in 0..nworkers {
+            sc.spawn(move || {
+                let mut sq = vec![0.0f64; len];
+                let mut out = vec![0.0f64; len];
+                let mut v = vec![0usize; len];
+                let mut z = vec![0.0f64; len + 1];
+                let p = ptr as *mut f32;
+                let mut l = w;
+                while l < nline {
+                    let base = base_of(l);
+                    // SAFETY:本条线的索引集合 {base + q*step} 与其他线不交(见函数注释),
+                    // 且 q*step 上界 = (len-1)*step + base < plane*nz。
+                    unsafe {
+                        for q in 0..len {
+                            sq[q] = *p.add(base + q * step) as f64;
+                        }
+                        edt_1d_into(&sq, &mut out, &mut v, &mut z);
+                        for q in 0..len {
+                            *p.add(base + q * step) = out[q] as f32;
+                        }
+                    }
+                    l += nworkers;
+                }
+            });
+        }
+    });
+}
+
+/// 重距离化的精确 EDT:种子(符号翻转棱,含沿棱的子格距离)不变,
+/// 用三轴距离变换求 min over 种子 q 的 sqrt(v_q² + |p−q|²)。
+///
+/// 为什么用 EDT 而不是八序扫掠:
+/// - 扫掠是**一阶迎风**格式,对点源/凸面源有 ~+30% 对角各向异性(教训 7,bake 已弃用);
+///   EDT 无此偏差,且在带内与三线性插值相容。
+/// - 扫掠需要 `rounds` 轮才有足够传播,且**固定点依赖更新顺序**——实测条带并行
+///   会收敛到与串行不同的不动点(偏差 1.8–3.5 格),因此"并行 + 逐位一致"不可兼得;
+///   EDT 是 O(N)、无迭代、无收敛参数,天然可并行且逐位可复现。
+pub fn edt_redist(d: &mut [f32], gn: [usize; 3], hf: f32, nt: usize) {
+    if nt == 0 {
+        return edt_redist(d, gn, hf, nthreads());
+    }
+    let inv = 1.0 / hf;
+    // mm → 格单位平方(距离上限约百格,平方在 f32 精确可表示区间内)
+    for v in d.iter_mut() {
+        *v = if v.is_finite() {
+            let t = *v * inv;
+            t * t
+        } else {
+            f32::INFINITY
+        };
+    }
+    for axis in 0..3 {
+        edt_axis_par(d, gn, axis, nt);
+    }
+    for v in d.iter_mut() {
+        *v = if v.is_finite() { v.sqrt() * hf } else { f32::INFINITY };
+    }
 }
 
 /// 多点判据:中心 + 6 面心的插值偏差最大值(角点插值恒等于角点值,零信息,不查)。
@@ -1633,20 +1806,37 @@ impl Adf {
         let gi = |i: usize, j: usize, k: usize| (k * ny + j) * nx + i;
 
         // 3) 符号场(退化场,符号恒正确)
+        let t_eval = std::time::Instant::now();
         let mut sv = vec![0f32; nx * ny * nz];
-        for k in 0..nz {
-            for j in 0..ny {
-                for i in 0..nx {
-                    sv[gi(i, j, k)] = self.eval([
-                        gmin[0] + i as Real * h,
-                        gmin[1] + j as Real * h,
-                        gmin[2] + k as Real * h,
-                    ]);
+        // 逐点 eval 是纯函数、彼此独立 → 按 k 平面切带并行(结果与线程数无关,
+        // 因为每个格点的值只由 (i,j,k) 位置决定,不依赖访问顺序)。
+        {
+            let this: &Adf = &*self;
+            let ppw = nz.div_ceil(nthreads()).max(1);
+            let band = ppw * nx * ny;
+            let chunks: Vec<&mut [f32]> = sv.chunks_mut(band).collect();
+            std::thread::scope(|sc| {
+                for (w, chunk) in chunks.into_iter().enumerate() {
+                    let k0 = w * ppw;
+                    sc.spawn(move || {
+                        for (idx, slot) in chunk.iter_mut().enumerate() {
+                            let k = k0 + idx / (nx * ny);
+                            let rem = idx % (nx * ny);
+                            let (j, i) = (rem / nx, rem % nx);
+                            *slot = this.eval([
+                                gmin[0] + i as Real * h,
+                                gmin[1] + j as Real * h,
+                                gmin[2] + k as Real * h,
+                            ]);
+                        }
+                    });
                 }
-            }
+            });
         }
 
         // 4) 距离格:INF 初始化,种子 = 符号翻转棱(端点距离 ≤ t·h)
+        st.t_eval = t_eval.elapsed();
+        let t_seed = std::time::Instant::now();
         let inf = f32::INFINITY;
         let mut d = vec![inf; nx * ny * nz];
         let hf = h as f32;
@@ -1696,46 +1886,27 @@ impl Adf {
             }
         }
 
-        // 5) 松弛:8 个八序方向轮流做 in-place **Godunov** 更新(3D Eikonal,欧氏距离)。
+        // 5) 精确 EDT 重距离化(见 edt_redist 的取舍说明)。
+        //    设 ADF_REDIST_SWEEP=1 可切回串行八序扫掠——仅作对账/回归用参考路径,
+        //    `rounds` 只在该路径下有意义。
+        st.t_seed = t_seed.elapsed();
+        let t_relax = std::time::Instant::now();
+        if std::env::var_os("ADF_REDIST_SWEEP").is_some() {
+            eikonal_sweep_serial(&mut d, gn, hf, rounds);
+        } else {
+            edt_redist(&mut d, gn, hf, nthreads());
+        }
         //    教训 5:简单 min(邻居)+h 松弛收敛到 L1(曼哈顿)距离 —— 实测空气区
         //    eval = L1(如 1.4647 = 30.7 格 × h 的曼哈顿路径);必须用 Godunov 多轴解。
-        let mut cand = [inf; 3];
-        for r in 0..rounds {
-            let (fx, fy, fz) = (r & 1 == 0, r & 2 == 0, r & 4 == 0);
-            for kz in 0..nz {
-                let k = if fz { kz } else { nz - 1 - kz };
-                for jy in 0..ny {
-                    let j = if fy { jy } else { ny - 1 - jy };
-                    for ix in 0..nx {
-                        let i = if fx { ix } else { nx - 1 - ix };
-                        let cur = d[gi(i, j, k)];
-                        if cur <= hf {
-                            continue; // 已是种子级
-                        }
-                        // 每轴取两侧邻居的较小值(Godunov 的 per-axis 候选)
-                        cand[0] = inf;
-                        if i > 0 { cand[0] = cand[0].min(d[gi(i - 1, j, k)]); }
-                        if i + 1 < nx { cand[0] = cand[0].min(d[gi(i + 1, j, k)]); }
-                        cand[1] = inf;
-                        if j > 0 { cand[1] = cand[1].min(d[gi(i, j - 1, k)]); }
-                        if j + 1 < ny { cand[1] = cand[1].min(d[gi(i, j + 1, k)]); }
-                        cand[2] = inf;
-                        if k > 0 { cand[2] = cand[2].min(d[gi(i, j, k - 1)]); }
-                        if k + 1 < nz { cand[2] = cand[2].min(d[gi(i, j, k + 1)]); }
-                        let t = eikonal_update(&mut cand, hf);
-                        if t < cur {
-                            d[gi(i, j, k)] = t;
-                        }
-                    }
-                }
-            }
-        }
 
         // 6) 写回:只修正空气侧(old > 0.5h)且偏离 > 0.25h 的角点
+        st.t_relax = t_relax.elapsed();
+        let t_write = std::time::Instant::now();
         let mut corrected = 0u64;
         let gmax = [gmin[0] + (nx - 1) as Real * h, gmin[1] + (ny - 1) as Real * h, gmin[2] + (nz - 1) as Real * h];
         Self::writeback_walk(&mut self.nodes, self.root, self.min, self.size, gmin, gmax, h, gn, &d, &mut corrected);
         st.corrected = corrected;
+        st.t_write = t_write.elapsed();
         st
     }
 
@@ -2411,6 +2582,9 @@ pub mod meshfield {
 
     impl MeshField {
         pub fn new(tris: Vec<[[Real; 3]; 3]>) -> MeshField {
+            // 空网格:根会是 cnt=0 的"叶",查询按 cnt>0 判叶会一路下降到 (0,0) 自环。
+            // 距离场对空网格无定义,早失败优于死循环。
+            assert!(!tris.is_empty(), "MeshField::new: 需要非空三角形列表");
             let mut order: Vec<u32> = (0..tris.len() as u32).collect();
             let mut bvh: Vec<Bvn> = Vec::new();
             let (mut aabb_min, mut aabb_max) = ([f64::MAX; 3], [f64::MIN; 3]);
@@ -2463,7 +2637,11 @@ pub mod meshfield {
                 let mid = lo + cnt / 2;
                 let l = rec(tris, order, bvh, lo, mid, aabb_min, aabb_max);
                 let rr = rec(tris, order, bvh, mid, hi, aabb_min, aabb_max);
-                bvh[self_idx as usize] = Bvn { mn, mx, left: l, right: rr, start: lo as u32, cnt: cnt as u32 };
+                // cnt = 0 是内部节点的**判别标志**:两条查询路径(closest_features_seeded /
+                // ray_parity_inside)都用 `cnt > 0 ⇒ 叶` 分流。此处置 0 之外任何值都会让
+                // 内部节点被当成叶,查询退化为扫描整段 order[lo..hi](= 全子树三角形),
+                // 树查询变线性扫描(实测 15.5 万三角 270µs/查,且与种子无关)。
+                bvh[self_idx as usize] = Bvn { mn, mx, left: l, right: rr, start: lo as u32, cnt: 0 };
                 self_idx
             }
             let mut amin = [f64::MAX; 3];
@@ -3150,6 +3328,112 @@ mod tests {
         eprintln!("[dbg] 切削完成 len={}", adf.nodes.len());
         check(&adf.nodes);
         eprintln!("[dbg] 切削后校验通过");
+    }
+
+
+    /// 轴对齐平面:EDT 必须**精确**复现(种子为 v=0 的整层格点,不存在离散化鼓包)。
+    /// 这是对三轴合成的硬校验:任何一轴的下抛物线包络写错都会破坏它。
+    #[test]
+    fn edt_redist_exact_for_axis_aligned_plane() {
+        let gn = [24usize, 20, 18];
+        let (nx, ny, nz) = (gn[0], gn[1], gn[2]);
+        let hf = 0.1f32;
+        let c0 = 11.0f32;
+        let mut d = vec![f32::INFINITY; nx * ny * nz];
+        for k in 0..nz {
+            for j in 0..ny {
+                d[(k * ny + j) * nx + 11] = 0.0;
+            }
+        }
+        edt_redist(&mut d, gn, hf, 8);
+        let mut maxdev = 0.0f32;
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    let truth = (i as f32 - c0).abs() * hf;
+                    let v = d[(k * ny + j) * nx + i];
+                    maxdev = maxdev.max((v - truth).abs());
+                }
+            }
+        }
+        assert!(maxdev <= 1e-5, "轴对齐平面应被精确重建,实测最大偏差 {maxdev}mm");
+    }
+
+    /// 斜面:种子只存在于 |d|<1 格的格点层,离散种子覆盖造成系统性高估(鼓包),
+    /// 实测 ~1 格。此测试把该量级钉住,防止 EDT 实现退化而不被察觉。
+    #[test]
+    fn edt_redist_tilted_plane_within_one_cell() {
+        let gn = [40usize, 33, 27];
+        let (nx, ny, nz) = (gn[0], gn[1], gn[2]);
+        let hf = 0.1f32;
+        let nrm = [0.6f64, 0.8, 0.0];
+        let p0 = [20.0f64, 16.5, 13.0];
+        let mut d = vec![f32::INFINITY; nx * ny * nz];
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    let q = [i as f64, j as f64, k as f64];
+                    let dist = (nrm[0] * (q[0] - p0[0]) + nrm[1] * (q[1] - p0[1])).abs();
+                    if dist < 1.0 {
+                        d[(k * ny + j) * nx + i] = (dist * hf as f64) as f32;
+                    }
+                }
+            }
+        }
+        let mut got = d.clone();
+        edt_redist(&mut got, gn, hf, 8);
+        let (mut maxdev, mut sum, mut cnt) = (0.0f64, 0.0f64, 0u64);
+        for k in 0..nz {
+            for j in 0..ny {
+                for i in 0..nx {
+                    let q = [i as f64, j as f64, k as f64];
+                    let truth = (nrm[0] * (q[0] - p0[0]) + nrm[1] * (q[1] - p0[1])).abs()
+                        * hf as f64;
+                    let v = got[(k * ny + j) * nx + i];
+                    assert!(v.is_finite(), "EDT 后仍为 INF,@({i},{j},{k})");
+                    let e = (v as f64 - truth).abs();
+                    maxdev = maxdev.max(e);
+                    sum += e;
+                    cnt += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[edt-redist] 斜面重建 {cnt} 格 | max {:.2} 格 | mean {:.2} 格",
+            maxdev / hf as f64,
+            sum / cnt as f64 / hf as f64
+        );
+        assert!(
+            maxdev <= 1.2 * hf as f64,
+            "斜面距离重建误差 {:.2} 格超过 1.2 格",
+            maxdev / hf as f64
+        );
+    }
+
+    /// EDT 重距离化必须逐位可复现(按线并行的确定性):不同工人数结果一致。
+    #[test]
+    fn edt_redist_reproducible_across_threads() {
+        let gn = [37usize, 29, 31];
+        let hf = 0.1f32;
+        let mut base = vec![f32::INFINITY; gn[0] * gn[1] * gn[2]];
+        let (nx, ny) = (gn[0], gn[1]);
+        for k in 0..gn[2] {
+            for j in 0..ny {
+                for i in 0..nx {
+                    if i == nx / 2 && (j + k) % 7 == 0 {
+                        base[(k * ny + j) * nx + i] = 0.05;
+                    }
+                }
+            }
+        }
+        for &nt in &[1usize, 3, 8, 16, 32] {
+            let mut got = base.clone();
+            edt_redist(&mut got, gn, hf, nt);
+            // 与 1 工人(纯串行)对照:逐位一致
+            let mut reference = base.clone();
+            edt_redist(&mut reference, gn, hf, 1);
+            assert_eq!(reference, got, "{nt} 工人的 EDT 结果与串行不一致");
+        }
     }
 
     #[test]

@@ -34,7 +34,7 @@ fn main() {
     let field = meshfield::MeshField::new(tm.tris);
     println!("[bvh] 构建 {:?} | 三角 {}", t.elapsed(), field.triangle_count());
     let (amn, amx) = (field.aabb_min, field.aabb_max);
-    let extent = (amx[0] - amn[0]).max((amx[1] - amn[1]).max((amx[2] - amn[2])));
+    let extent = (amx[0] - amn[0]).max((amx[1] - amn[1]).max(amx[2] - amn[2]));
     let margin = extent * 0.06 + 1.0;
     let min = [amn[0] - margin, amn[1] - margin, amn[2] - margin];
     let size = extent + 2.0 * margin;
@@ -112,6 +112,39 @@ fn main() {
         st.grid_n,
         st.corrected
     );
+    println!(
+        "[redist.phase] 符号场 {:?} | 棱种子 {:?} | 松弛 {:?} | 写回 {:?}",
+        st.t_eval, st.t_seed, st.t_relax, st.t_write
+    );
+
+    // ── 6b) 场精度复核(切削后,限定刀路区表面邻域):ADF vs 复合场真值 ──
+    //      这是重距离化路径的直接质量指标:比体积对账更贴近"加工面准不准"。
+    {
+        let mut rng = Rng::new(7777);
+        let (mut max_e, mut sum_e) = (0.0f64, 0.0f64);
+        let mut cnt = 0u64;
+        for _ in 0..40000 {
+            let p = [
+                min[0] + rng.f01() * size,
+                min[1] + rng.f01() * size,
+                min[2] + rng.f01() * size,
+            ];
+            let t = adf.true_sd(p);
+            if t.abs() > 2.0 {
+                continue; // 只看表面邻域(深场由粗格承担,不属重距离化职责)
+            }
+            let e = (adf.eval(p) as Real - t).abs();
+            max_e = max_e.max(e);
+            sum_e += e;
+            cnt += 1;
+        }
+        if cnt > 0 {
+            println!(
+                "[error.cut] 刀路区表面邻域 {cnt} 点(|真值|≤2mm):ADF vs 复合场 max={max_e:.4} mean={:.4} mm",
+                sum_e / cnt as Real
+            );
+        }
+    }
 
     // ── 7) Surface Nets 提取 + STL 导出 + 体积对账 ──
     let h_ext = h_min * 2.0;
