@@ -621,7 +621,10 @@ fn bake_field(base: &BaseField, min: [Real; 3], size: Real) -> (BakeGrid, CandGr
         BaseField::Mesh(m) => m,
         BaseField::Stock(_) => unreachable!(),
     };
-    // ── ① 候选光栅化(按 k-板并行,线程本地表,无锁;三角形 AABB 外扩 1 格)──
+    // ── ① 候选光栅化(按 k-板并行,线程本地表,无锁;三角形 AABB 外扩 2 格)──
+    // 外扩 E 格 ⟹ 离三角 d < E·h 的格点必有候选。站点带要 1.5h(见②),
+    // E=1 只保 d<h:带上 d∈[h,1.5h] 处出现无种子孔洞,材料内部的洪泛区
+    // 从洞漏进叶片缝隙,把缝隙标成"材料内"(叶轮实测 ADF 零面外扩 1.15mm)。
     let clampi = |t: Real| t.clamp(0.0, (n - 1) as Real) as usize;
     let nthreads = 12usize;
     let kslab = n.div_ceil(nthreads);
@@ -644,12 +647,12 @@ fn bake_field(base: &BaseField, min: [Real; 3], size: Real) -> (BakeGrid, CandGr
                             cmx[a] = cmx[a].max(v[a]);
                         }
                     }
-                    let i0 = clampi(((cmn[0] - min[0]) / h).floor() - 1.0);
-                    let i1 = clampi(((cmx[0] - min[0]) / h).ceil() + 1.0);
-                    let j0 = clampi(((cmn[1] - min[1]) / h).floor() - 1.0);
-                    let j1 = clampi(((cmx[1] - min[1]) / h).ceil() + 1.0);
-                    let kk0 = clampi(((cmn[2] - min[2]) / h).floor() - 1.0).max(k0);
-                    let kk1 = (clampi(((cmx[2] - min[2]) / h).ceil() + 1.0) + 1).min(k1);
+                    let i0 = clampi(((cmn[0] - min[0]) / h).floor() - 2.0);
+                    let i1 = clampi(((cmx[0] - min[0]) / h).ceil() + 2.0);
+                    let j0 = clampi(((cmn[1] - min[1]) / h).floor() - 2.0);
+                    let j1 = clampi(((cmx[1] - min[1]) / h).ceil() + 2.0);
+                    let kk0 = clampi(((cmn[2] - min[2]) / h).floor() - 2.0).max(k0);
+                    let kk1 = (clampi(((cmx[2] - min[2]) / h).ceil() + 2.0) + 1).min(k1);
                     for k in kk0..kk1 {
                         for j in j0..=j1 {
                             for i in i0..=i1 {
@@ -2577,14 +2580,17 @@ pub mod nets {
                     }
                 }
             }
-            // Newton 投影回零等值面:2 步,梯度用前向差分
+            // Newton 投影回零等值面:8 步(锐边处平滑会把顶点拉离表面 >1mm,
+            // 2 步+限幅收不完;对已收敛顶点幂等,多迭代无副作用)
             let hstep = 1e-3 * adf.size;
-            for _ in 0..2 {
+            for _ in 0..8 {
                 for i in 0..n {
                     let q = [p[i][0], p[i][1], p[i][2]];
                     let d0 = adf.eval(q) as f64;
-                    if d0.abs() > 4.0 * max_disp as f64 {
-                        continue; // 离面太远,不投影(应为碎屑或退化点)
+                    // 只挡真正飞掉的点(碎屑已在投影前清理);阈值太紧会把
+                    // 锐边处合法的 1mm 级顶点挡在投影门外(实测卡在 1.25mm)
+                    if d0.abs() > 8.0 * max_disp as f64 {
+                        continue; // 离面太远,不投影
                     }
                     let mut g = [0.0f64; 3];
                     for k in 0..3 {
@@ -2597,14 +2603,16 @@ pub mod nets {
                     if g2 < 0.25 {
                         continue;
                     }
-                    // 单步位移限制在 max_disp 内,防止一步跳出模型
+                    // 投影步长上限放宽到 4×max_disp:max_disp 是为**平滑**设的,
+                    // 用它钳投影会让 0.5mm 级的尖刺永远收不回来(实测卡在 0.91%)。
+                    let lim = 4.0 * max_disp as f64;
                     let mut step = [0.0f64; 3];
                     for k in 0..3 {
                         step[k] = -d0 * g[k] / g2;
                     }
                     let sl = (step[0] * step[0] + step[1] * step[1] + step[2] * step[2]).sqrt();
-                    if sl > max_disp as f64 {
-                        let f = max_disp as f64 / sl;
+                    if sl > lim {
+                        let f = lim / sl;
                         for k in 0..3 {
                             step[k] *= f;
                         }
@@ -3716,8 +3724,36 @@ pub mod meshfield {
             (best.sqrt(), best_t, best_feat, best_cp)
         }
 
-        /// 由 (三角形, 特征码, 最近点) 给出伪法线有符号距离。
+        /// 由 (三角形, 特征码, 最近点) 给出有符号距离。
+        ///
+        /// 面特征(feat=6):cp 在三角内部,p−cp ⊥ 面伪法线判号**精确**。
+        /// 边/顶点特征(feat≤5):edge_n/vert_n(邻面法线和)的 ±90° 锥与
+        /// 面的 Voronoi 区**不对齐**——薄叶片边缘(材料楔角 θ 小)周围约
+        /// 180°−θ 的空气方位落在锥外被误判"内"(叶轮实测:缝隙区一片格点
+        /// bake=−0.609 vs 真值 +0.609,零等值面外扩 1.15mm,提取出 203 个
+        /// 碎屑分量)。故边/顶点一律**随机方向射线投票**仲裁:全局穿越计数
+        /// 不依赖局部方位;方向按位置哈希取 + 原点微抖,避免固定方向与
+        /// 规则三角化网格系统性掠射(桌腿固定 7 向实测:模型底面规则网格
+        /// 擦边 → 2134 个碎屑分量)。
         pub fn signed_from_feature(&self, p: [Real; 3], t: u32, feat: u8, cp: [Real; 3]) -> Real {
+            let d = len(sub3(p, cp));
+            let sgn = if feat == 6 {
+                let n: [Real; 3] = [
+                    self.face_n[t as usize][0] as Real,
+                    self.face_n[t as usize][1] as Real,
+                    self.face_n[t as usize][2] as Real,
+                ];
+                if dot3(sub3(p, cp), n) >= 0.0 { 1.0 } else { -1.0 }
+            } else if self.parity_inside_vote(p) {
+                -1.0
+            } else {
+                1.0
+            };
+            sgn * d
+        }
+
+        /// [诊断] 特征伪法线与三角顶点(signed_from_feature 的内部视角)
+        pub fn debug_feature_normal(&self, t: u32, feat: u8) -> ([Real; 3], [u32; 3]) {
             let n: [Real; 3] = match feat {
                 0..=2 => {
                     let v = self.vert_n[self.tri_vid[t as usize][feat as usize] as usize];
@@ -3743,11 +3779,7 @@ pub mod meshfield {
                     [v[0] as Real, v[1] as Real, v[2] as Real]
                 }
             };
-            if dot3(sub3(p, cp), n) >= 0.0 {
-                len(sub3(p, cp))
-            } else {
-                -len(sub3(p, cp))
-            }
+            (n, self.tri_vid[t as usize])
         }
 
         /// best-first 最近点核心:(距离² 开方, 三角形索引, 特征码, 最近点)。
@@ -3856,11 +3888,8 @@ pub mod meshfield {
             self.signed_from_feature(p, t, feat, cp)
         }
 
-        /// 射线奇偶:偶数=外,奇数=内(要求水密网格;固定对角射线避开顶点)。
-        /// 栈数组替代 per-call Vec 堆分配。现主要作伪法线符号的交叉验证与
-        /// 水密性诊断;热路径符号已由 signed_distance_pn 承担。
-        pub fn ray_parity_inside(&self, p: [Real; 3]) -> bool {
-            let dir = PARITY_DIR;
+        /// 射线奇偶核心:给定方向的穿越计数(偶=外,奇=内)。要求水密网格。
+        fn parity_hits(&self, p: [Real; 3], dir: [Real; 3]) -> u32 {
             let inv = [1.0 / dir[0], 1.0 / dir[1], 1.0 / dir[2]];
             let mut hits = 0u32;
             let mut stack = [0u32; 128];
@@ -3901,7 +3930,55 @@ pub mod meshfield {
                     sp += 1;
                 }
             }
-            hits % 2 == 1
+            hits
+        }
+
+        /// 射线奇偶:偶数=外,奇数=内(要求水密网格;固定对角射线避开顶点)。
+        /// 栈数组替代 per-call Vec 堆分配。现主要作伪法线符号的交叉验证与
+        /// 水密性诊断;热路径符号已由 signed_distance_pn 承担。
+        pub fn ray_parity_inside(&self, p: [Real; 3]) -> bool {
+            self.parity_hits(p, PARITY_DIR) % 2 == 1
+        }
+
+        /// 多方向射线奇偶投票:叶片缝隙/锐边处伪法线判号不可靠(见
+        /// signed_from_feature),用全局穿越计数仲裁。
+        ///
+        /// 方向按**位置哈希**伪随机取、原点微抖:固定方向集会与规则三角化
+        /// 网格(平面阵列)系统性掠射——桌腿实测固定 7 向在模型底面成片
+        /// 擦边错号,提取出 2134 个碎屑分量;随机方向逐点不同,擦边残余
+        /// 退化为孤立错号格点,不连片、可被碎屑清理兜住。
+        pub fn parity_inside_vote(&self, p: [Real; 3]) -> bool {
+            // splitmix64:零依赖、分布均匀、逐点不同
+            let mut s = p[0].to_bits()
+                ^ p[1].to_bits().rotate_left(17)
+                ^ p[2].to_bits().rotate_left(34);
+            let mut next = || {
+                s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = s;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^ (z >> 31)
+            };
+            // 原点抖动:避开与表面顶点/边精确共线(1e-4·尺寸 ≪ 任何几何特征)
+            const JITTER: f64 = 1e-4;
+            const VOTES: usize = 5;
+            let mut inside = 0usize;
+            for _ in 0..VOTES {
+                // 均匀 [0,1):指数位固定 1.0、尾数取随机位,减 1 得 [0,1)
+                let mut u = || f64::from_bits(0x3FF0_0000_0000_0000 | (next() >> 12)) - 1.0;
+                // 均匀球面方向:z 均匀取 [-1,1],φ 均匀取 [0,2π)
+                let z = u() * 2.0 - 1.0;
+                let phi = u() * 2.0 * std::f64::consts::PI;
+                let r = (1.0 - z * z).sqrt();
+                let dir = [r * phi.cos(), r * phi.sin(), z];
+                let q = [
+                    p[0] + (u() * 2.0 - 1.0) * JITTER,
+                    p[1] + (u() * 2.0 - 1.0) * JITTER,
+                    p[2] + (u() * 2.0 - 1.0) * JITTER,
+                ];
+                inside += (self.parity_hits(q, dir) % 2 == 1) as usize;
+            }
+            inside * 2 > VOTES
         }
 
         pub fn signed_distance(&self, p: [Real; 3]) -> Real {

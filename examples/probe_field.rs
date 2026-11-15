@@ -32,8 +32,9 @@ fn main() {
     let min = [amn[0] - margin, amn[1] - margin, amn[2] - margin];
     let size = extent + 2.0 * margin;
     let max_depth = (((size / h_target).log2().ceil()) as u8).clamp(6, 10);
-    let (eps, band) = (0.002, 0.5);
-    println!("[probe] {path} | 深度 {max_depth} | 输入体积 {vol_in:.1}");
+    let band: Real = std::env::var("ADF_BAND").ok().and_then(|v| v.parse().ok()).unwrap_or(0.5);
+    let eps: Real = 0.002;
+    println!("[probe] {path} | 深度 {max_depth} | band {band} | 输入体积 {vol_in:.1}");
 
     let adf = Adf::build_with(
         Composite { base: BaseField::Mesh(field), cuts: Vec::new() },
