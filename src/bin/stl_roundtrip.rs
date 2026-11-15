@@ -126,6 +126,19 @@ fn main() {
             // 吸附把锐边顶点拉回缘线,邻接窄带三角被挤扁 → 清理针状薄片
             let nsl = mesh.collapse_slivers(0.015, 4);
             println!("[snap2] {:?} | 重吸附 {ns} 锐边顶点,清薄片 {nsl}", t5.elapsed());
+            // 真折叠(边缘多余面片)修复:场梯度仲裁(折叠面法线逆梯度,
+            // 合法薄板带顺梯度)——塌缩真折叠,合并点投影回零面;修复点
+            // 的残余偏移由随后的重吸附拉回缘线。
+            if std::env::var("ADF_NO_REPAIR2").is_err() {
+                let t6 = Instant::now();
+                let (nc2, nr2) = mesh.repair_folds(&adf, 0.5, 0.004, 0.002, h_ext as f64 * 4.0, 10);
+                let nsl2 = mesh.collapse_slivers(0.015, 4);
+                let ns2 = mesh.snap_sharp_to_rim(&adf, 0.5, 0.95);
+                println!(
+                    "[repair2] {:?} | 折叠塌缩 {nc2},删面 {nr2},清薄片 {nsl2},重吸附 {ns2}",
+                    t6.elapsed()
+                );
+            }
         }
     }
     let (open, nonman, comps) = mesh.edge_stats();
