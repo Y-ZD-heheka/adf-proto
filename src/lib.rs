@@ -186,6 +186,8 @@ pub struct LatticeCache {
 /// f32 NaN 的规范位模式,作"未计算"哨兵(格点真值永不为 NaN)。
 const NAN_BITS: u32 = 0x7fc0_0000;
 /// 贪心播种的网格规模阈值(小网格堆展开少,播种纯开销)
+/// 保留:贪心播种路径已删除(教训 5),此阈值不再被消费,留作口径记录。
+#[allow(dead_code)]
 const SEED_MIN_TRIS: usize = 2048;
 /// 距离场 INF 哨兵(Fast Sweeping 未到达)
 const INF32: f32 = f32::INFINITY;
@@ -459,6 +461,9 @@ fn edt_axis(d2: &mut [f64], arg: &mut [u32], n: usize, axis: usize) {
 /// 壳层键(|d| ≤ band+0.3)的精确计算走 7³ 邻域线性扫描 ——
 /// 实测:15.5 万网格上 BVH 遍历(带贪心种子)对薄叶片几何仍 30–100µs/键,
 /// 邻域候选 ~30 条 × ~0.1µs ≈ 3µs;高曲率件(叶片)细键数 ~20× 于平板件。
+/// **参考实现(已不在生产路径)**:种子 BVH 落地后,7³ 邻域候选扫描被反超
+/// (教训 4),`bake_field` 仍返回它但调用方已丢弃。保留代码与注释供对照。
+#[allow(dead_code)]
 pub struct CandGrid {
     pub min: [Real; 3],
     pub n: usize,
@@ -466,6 +471,7 @@ pub struct CandGrid {
     pub cells: Vec<Vec<u32>>,
 }
 
+#[allow(dead_code)]
 impl CandGrid {
     fn empty() -> Self {
         Self { min: [0.0; 3], n: 0, h: 1.0, cells: Vec::new() }
@@ -544,9 +550,6 @@ impl ExactSrc<'_> {
 pub static DBG_CAND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static DBG_CAND_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static DBG_CAND_FB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static SEG_DESCENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static SEG_HEAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static SEG_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn bake_field(base: &BaseField, min: [Real; 3], size: Real) -> (BakeGrid, CandGrid) {
     let n = 129usize;
     let h = size / (n - 1) as Real;
@@ -2165,6 +2168,79 @@ pub mod nets {
         }
     }
 
+    /// 单向棱连接的一个 k 切片(k ∈ [klo,khi)),产出 quad 到 out。
+    /// 与串行版逐字对齐:同一坐标、同一 quad 顶点序、同一 want 方向。
+    /// 三个方向共用,区别仅在索引表达式(见 axis 分支)。
+    #[allow(clippy::too_many_arguments)]
+    fn quads_slab(
+        axis: usize,
+        klo: usize,
+        khi: usize,
+        n: usize,
+        dim: usize,
+        vals: &[f32],
+        cell_vert: &[u32],
+        verts: &[[f32; 3]],
+        out: &mut Vec<[u32; 3]>,
+    ) {
+        let cv = |i: usize, j: usize, k: usize| -> u32 { cell_vert[(k * n + j) * n + i] };
+        for k in klo..khi {
+            match axis {
+                0 => {
+                    for j in 1..n {
+                        for i in 0..n {
+                            let a = vals[(k * dim + j) * dim + i];
+                            let b = vals[(k * dim + j) * dim + i + 1];
+                            if (a < 0.0) == (b < 0.0) {
+                                continue;
+                            }
+                            let q = [cv(i, j, k), cv(i, j - 1, k), cv(i, j - 1, k - 1), cv(i, j, k - 1)];
+                            if q.iter().any(|v| *v == u32::MAX) {
+                                continue;
+                            }
+                            let want = if a < 0.0 { [1.0, 0.0, 0.0] } else { [-1.0, 0.0, 0.0] };
+                            push_quad(verts, q, want, out);
+                        }
+                    }
+                }
+                1 => {
+                    for j in 0..n {
+                        for i in 1..n {
+                            let a = vals[(k * dim + j) * dim + i];
+                            let b = vals[(k * dim + (j + 1)) * dim + i];
+                            if (a < 0.0) == (b < 0.0) {
+                                continue;
+                            }
+                            let q = [cv(i, j, k), cv(i - 1, j, k), cv(i - 1, j, k - 1), cv(i, j, k - 1)];
+                            if q.iter().any(|v| *v == u32::MAX) {
+                                continue;
+                            }
+                            let want = if a < 0.0 { [0.0, 1.0, 0.0] } else { [0.0, -1.0, 0.0] };
+                            push_quad(verts, q, want, out);
+                        }
+                    }
+                }
+                _ => {
+                    for j in 1..n {
+                        for i in 1..n {
+                            let a = vals[(k * dim + j) * dim + i];
+                            let b = vals[((k + 1) * dim + j) * dim + i];
+                            if (a < 0.0) == (b < 0.0) {
+                                continue;
+                            }
+                            let q = [cv(i, j, k), cv(i - 1, j, k), cv(i - 1, j - 1, k), cv(i, j - 1, k)];
+                            if q.iter().any(|v| *v == u32::MAX) {
+                                continue;
+                            }
+                            let want = if a < 0.0 { [0.0, 0.0, 1.0] } else { [0.0, 0.0, -1.0] };
+                            push_quad(verts, q, want, out);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// 均匀重采样 + Surface Nets 提取。h:重采样格宽(建议 h_min 或其 2 倍)。
     pub fn extract_uniform(adf: &Adf, h: Real) -> Mesh {
         let n = ((adf.size / h).round() as usize).max(1);
@@ -2172,121 +2248,164 @@ pub mod nets {
         let step = adf.size / n as Real;
 
         // 1) 角点均匀重采样(走 ADF eval——自适应结构在这里兑现价值)
+        //    逐点纯函数、与访问顺序无关 → 按 k 平面切带并行,结果逐位可复现。
+        //    dim³ 次 eval 是本函数的主要成本(桌腿 513³≈1.35 亿次,占提取耗时 ~85%);
+        //    串行时 4.0s,串行也是它把 extract 顶成全管线最大单项。
         let mut vals = vec![0f32; dim * dim * dim];
-        for k in 0..dim {
-            for j in 0..dim {
-                for i in 0..dim {
-                    vals[(k * dim + j) * dim + i] = adf.eval([
-                        adf.min[0] + i as Real * step,
-                        adf.min[1] + j as Real * step,
-                        adf.min[2] + k as Real * step,
-                    ]);
+        {
+            let plane = dim * dim;
+            let ppw = dim.div_ceil(nthreads()).max(1);
+            let band = ppw * plane;
+            let chunks: Vec<&mut [f32]> = vals.chunks_mut(band).collect();
+            let min = adf.min;
+            std::thread::scope(|sc| {
+                for (w, chunk) in chunks.into_iter().enumerate() {
+                    let k0 = w * ppw;
+                    sc.spawn(move || {
+                        for (idx, slot) in chunk.iter_mut().enumerate() {
+                            let k = k0 + idx / plane;
+                            let rem = idx % plane;
+                            let (j, i) = (rem / dim, rem % dim);
+                            *slot = adf.eval([
+                                min[0] + i as Real * step,
+                                min[1] + j as Real * step,
+                                min[2] + k as Real * step,
+                            ]);
+                        }
+                    });
                 }
-            }
+            });
         }
 
         // 2) 变号 cell 一个顶点 = 12 棱交叉点平均(经典 Surface Nets)
+        //    按 ck 切 k 平面并行:每片产出**局部**顶点号写入本片 cell_vert,
+        //    之后按片序合并(片内顶点先于后片)⟹ 与串行顶点编号逐位一致。
         let mut cell_vert = vec![u32::MAX; n * n * n];
         let mut verts: Vec<[f32; 3]> = Vec::new();
-        for ck in 0..n {
-            for cj in 0..n {
-                for ci in 0..n {
-                    let mut cv = [0f32; 8];
-                    let (mut any_neg, mut any_pos) = (false, false);
-                    for c in 0..8 {
-                        let (dx, dy, dz) = (c & 1, (c >> 1) & 1, (c >> 2) & 1);
-                        let v = vals[((ck + dz) * dim + (cj + dy)) * dim + (ci + dx)];
-                        cv[c] = v;
-                        any_neg |= v < 0.0;
-                        any_pos |= v >= 0.0;
-                    }
-                    if !(any_neg && any_pos) {
-                        continue;
-                    }
-                    let o = [
-                        adf.min[0] + ci as Real * step,
-                        adf.min[1] + cj as Real * step,
-                        adf.min[2] + ck as Real * step,
-                    ];
-                    let (mut vx, mut vy, mut vz) = (0.0, 0.0, 0.0);
-                    let mut cnt = 0u32;
-                    for (a, b) in EDGES {
-                        let (va, vb) = (cv[a] as Real, cv[b] as Real);
-                        if (va < 0.0) != (vb < 0.0) {
-                            let t = va / (va - vb);
-                            let pa = corner_pos(o, step, a);
-                            let pb = corner_pos(o, step, b);
-                            vx += pa[0] + (pb[0] - pa[0]) * t;
-                            vy += pa[1] + (pb[1] - pa[1]) * t;
-                            vz += pa[2] + (pb[2] - pa[2]) * t;
-                            cnt += 1;
+        {
+            let nslab = n;
+            let mut slabs: Vec<&mut [u32]> = cell_vert.chunks_mut(n * n).collect();
+            debug_assert_eq!(slabs.len(), nslab);
+            let locals: Vec<std::sync::Mutex<Vec<[f32; 3]>>> =
+                (0..nslab).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+            let mut jobs: Vec<(usize, &mut [u32])> = slabs.drain(..).enumerate().collect();
+            let nt = nthreads().min(nslab).max(1);
+            let mut per: Vec<Vec<(usize, &mut [u32])>> =
+                (0..nt).map(|_| Vec::new()).collect();
+            for (s, job) in jobs.drain(..).enumerate() {
+                per[s % nt].push(job);
+            }
+            let vmin = adf.min;
+            let vals_r: &[f32] = &vals;
+            std::thread::scope(|sc| {
+                for mine in per.into_iter() {
+                    let locals = &locals;
+                    sc.spawn(move || {
+                        for (ck, slab) in mine {
+                            let mut out: Vec<[f32; 3]> = Vec::new();
+                            for cj in 0..n {
+                                for ci in 0..n {
+                                    let mut cv = [0f32; 8];
+                                    let (mut any_neg, mut any_pos) = (false, false);
+                                    for c in 0..8 {
+                                        let (dx, dy, dz) = (c & 1, (c >> 1) & 1, (c >> 2) & 1);
+                                        let v = vals_r[((ck + dz) * dim + (cj + dy)) * dim + (ci + dx)];
+                                        cv[c] = v;
+                                        any_neg |= v < 0.0;
+                                        any_pos |= v >= 0.0;
+                                    }
+                                    if !(any_neg && any_pos) {
+                                        continue;
+                                    }
+                                    let o = [
+                                        vmin[0] + ci as Real * step,
+                                        vmin[1] + cj as Real * step,
+                                        vmin[2] + ck as Real * step,
+                                    ];
+                                    let (mut vx, mut vy, mut vz) = (0.0, 0.0, 0.0);
+                                    let mut cnt = 0u32;
+                                    for (a, b) in EDGES {
+                                        let (va, vb) = (cv[a] as Real, cv[b] as Real);
+                                        if (va < 0.0) != (vb < 0.0) {
+                                            let t = va / (va - vb);
+                                            let pa = corner_pos(o, step, a);
+                                            let pb = corner_pos(o, step, b);
+                                            vx += pa[0] + (pb[0] - pa[0]) * t;
+                                            vy += pa[1] + (pb[1] - pa[1]) * t;
+                                            vz += pa[2] + (pb[2] - pa[2]) * t;
+                                            cnt += 1;
+                                        }
+                                    }
+                                    if cnt == 0 {
+                                        continue;
+                                    }
+                                    let c = cnt as Real;
+                                    slab[cj * n + ci] = out.len() as u32; // 局部号
+                                    out.push([(vx / c) as f32, (vy / c) as f32, (vz / c) as f32]);
+                                }
+                            }
+                            *locals[ck].lock().unwrap() = out;
                         }
-                    }
-                    if cnt == 0 {
-                        continue;
-                    }
-                    let c = cnt as Real;
-                    let vi = verts.len() as u32;
-                    verts.push([(vx / c) as f32, (vy / c) as f32, (vz / c) as f32]);
-                    cell_vert[(ck * n + cj) * n + ci] = vi;
+                    });
                 }
+            });
+            // 按片序合并:局部号 + 偏移 → 全局号
+            for s in 0..nslab {
+                let off = verts.len() as u32;
+                let mut loc = locals[s].lock().unwrap();
+                let base = s * n * n;
+                for e in cell_vert[base..base + n * n].iter_mut() {
+                    if *e != u32::MAX {
+                        *e += off;
+                    }
+                }
+                verts.append(&mut loc);
             }
         }
-        let cv = |i: usize, j: usize, k: usize| -> u32 { cell_vert[(k * n + j) * n + i] };
-
         // 3) 网格棱变号 → 环绕该棱的 4 个 cell 顶点连 quad(push_quad 自定向)
+        //    串行顺序 = 全 x 向 → 全 y 向 → 全 z 向;每向内部 k 递增。
+        //    因此每向按 k 切片并行、再按片序合并,三角顺序与串行**逐位一致**。
+        //    棱四邻 cell 只在 j/k ∈ [1, n) 内完整;域边界层跳过(表面不该触边,
+        //    远场噪声变号在此组装会读到越界 cell_vert——实测 Impeller panic)。
         let mut tris: Vec<[u32; 3]> = Vec::new();
-        // 棱四邻 cell 只在 j/k ∈ [1, n) 内完整;域边界层跳过(表面不该触边,
-        // 远场噪声变号在此组装会读到越界 cell_vert——实测 Impeller panic)
-        for k in 1..n {
-            for j in 1..n {
-                for i in 0..n {
-                    let a = vals[(k * dim + j) * dim + i];
-                    let b = vals[(k * dim + j) * dim + i + 1];
-                    if (a < 0.0) == (b < 0.0) {
-                        continue;
-                    }
-                    let q = [cv(i, j, k), cv(i, j - 1, k), cv(i, j - 1, k - 1), cv(i, j, k - 1)];
-                    if q.iter().any(|v| *v == u32::MAX) {
-                        continue;
-                    }
-                    let want = if a < 0.0 { [1.0, 0.0, 0.0] } else { [-1.0, 0.0, 0.0] };
-                    push_quad(&verts, q, want, &mut tris);
-                }
+        for axis in 0..3usize {
+            let k_lo = if axis == 2 { 0 } else { 1 };
+            let nslab = n - k_lo;
+            if nslab == 0 {
+                continue;
             }
-        }
-        for k in 1..n {
-            for j in 0..n {
-                for i in 1..n {
-                    let a = vals[(k * dim + j) * dim + i];
-                    let b = vals[(k * dim + (j + 1)) * dim + i];
-                    if (a < 0.0) == (b < 0.0) {
-                        continue;
-                    }
-                    let q = [cv(i, j, k), cv(i - 1, j, k), cv(i - 1, j, k - 1), cv(i, j, k - 1)];
-                    if q.iter().any(|v| *v == u32::MAX) {
-                        continue;
-                    }
-                    let want = if a < 0.0 { [0.0, 1.0, 0.0] } else { [0.0, -1.0, 0.0] };
-                    push_quad(&verts, q, want, &mut tris);
+            let locals: Vec<std::sync::Mutex<Vec<[u32; 3]>>> =
+                (0..nslab).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+            let nt = nthreads().min(nslab).max(1);
+            std::thread::scope(|sc| {
+                for w in 0..nt {
+                    let locals = &locals;
+                    let vals = &vals;
+                    let cell_vert = &cell_vert;
+                    let verts = &verts;
+                    sc.spawn(move || {
+                        let mut s = w;
+                        while s < nslab {
+                            let mut out: Vec<[u32; 3]> = Vec::new();
+                            quads_slab(
+                                axis,
+                                k_lo + s,
+                                k_lo + s + 1,
+                                n,
+                                dim,
+                                vals,
+                                cell_vert,
+                                verts,
+                                &mut out,
+                            );
+                            *locals[s].lock().unwrap() = out;
+                            s += nt;
+                        }
+                    });
                 }
-            }
-        }
-        for k in 0..n {
-            for j in 1..n {
-                for i in 1..n {
-                    let a = vals[(k * dim + j) * dim + i];
-                    let b = vals[((k + 1) * dim + j) * dim + i];
-                    if (a < 0.0) == (b < 0.0) {
-                        continue;
-                    }
-                    let q = [cv(i, j, k), cv(i - 1, j, k), cv(i - 1, j - 1, k), cv(i, j - 1, k)];
-                    if q.iter().any(|v| *v == u32::MAX) {
-                        continue;
-                    }
-                    let want = if a < 0.0 { [0.0, 0.0, 1.0] } else { [0.0, 0.0, -1.0] };
-                    push_quad(&verts, q, want, &mut tris);
-                }
+            });
+            for mut slot in locals {
+                tris.append(slot.get_mut().unwrap());
             }
         }
 
@@ -2829,7 +2948,6 @@ pub mod meshfield {
         /// 砍到最近邻域。实测:15.5 万网格薄叶片几何 30–100µs/键 → 个位数 µs。
         /// 种子来源:BakeGrid 值 + 2.5·h_c(EDT 界 d−h ≲ grid ≲ d+1.8h ⇒ seed ≥ d)。
         pub fn closest_features_seeded(&self, p: [Real; 3], seed_d2: f64) -> (Real, u32, u8, [Real; 3]) {
-            let seg0 = std::time::Instant::now();
             let mut best = seed_d2;
             let mut best_t = 0u32;
             let mut best_feat = 6u8;
@@ -2837,8 +2955,6 @@ pub mod meshfield {
             // 播种:网格种子(粗距 + 2.5h_c 上界)直接作堆剪枝初值。
             // (旧"贪心下降"实测 1.24ms/调用 = 80% 耗时,且与网格种子功能重复,已删;
             //  网格 EDT 界 d−h ≲ grid ≲ d+1.8h ⇒ seed = grid+2.5h ≥ d,上界成立)
-            SEG_DESCENT.fetch_add(seg0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            let seg1 = std::time::Instant::now();
             let mut heap = std::collections::BinaryHeap::new();
             // 非负 f64 的 to_bits 保持全序 → 直接作为堆键
             heap.push(std::cmp::Reverse((0f64.to_bits(), self.root)));
@@ -2896,8 +3012,6 @@ pub mod meshfield {
                     }
                 }
             }
-                        SEG_HEAP.fetch_add(seg1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            SEG_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (best.sqrt(), best_t, best_feat, best_cp)
         }
 
@@ -3587,5 +3701,33 @@ mod tests {
             "球体积应 ≈4.19(实际 {v:.3})——绕向或提取有误"
         );
         nets::write_stl("target/test_sphere.stl", &m).expect("STL 写出失败");
+    }
+
+    /// 提取的并行化不得引入顺序相关:顶点号由"k 片序 + 片内 cj/ci 序"决定,
+    /// 三角由"方向序 × k 片序 × 片内 j/i 序"决定,故任何工人数下都应逐位一致。
+    /// 本测试连跑两次比对(竞争或非确定合并会在此暴露),并把拓扑自洽性
+    /// (三角索引不越界、有符号体积为正)一起守住。
+    #[test]
+    fn nets_extract_deterministic_and_wound() {
+        let a = Adf::build(
+            Stock::RoundBox { c: [0.0; 3], half: [1.5; 3], r: 0.4 },
+            [-2.0; 3],
+            4.0,
+            0.005,
+            0.2,
+            6,
+        );
+        let m1 = nets::extract_uniform(&a, 0.1);
+        let m2 = nets::extract_uniform(&a, 0.1);
+        assert_eq!(m1.verts, m2.verts, "两次提取的顶点不一致(并行不确定)");
+        assert_eq!(m1.tris, m2.tris, "两次提取的三角不一致(并行不确定)");
+        let nv = m1.verts.len() as u32;
+        for t in &m1.tris {
+            for &i in t {
+                assert!(i < nv, "三角索引 {i} 越界(顶点数 {nv})——片间偏移合并有误");
+            }
+        }
+        let v = m1.signed_volume();
+        assert!(v > 0.0, "有符号体积应为正(绕向一致),实际 {v}");
     }
 }
