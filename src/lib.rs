@@ -641,26 +641,39 @@ fn bake_field(base: &BaseField, min: [Real; 3], size: Real) -> (BakeGrid, CandGr
     let cg = CandGrid { min, n, h, cells };
     let cands = &cg.cells;
     // ── ② 局部精确初始化(自格候选;外扩 1 格已保证 |d| ≲ 1.5h 有种子)──
+    //    逐格点独立、无共享写 → 按 k 平面切带并行(结果与工人数无关)。
     let mut phi = vec![INF32; npts];
-    for k in 0..n {
-        for j in 0..n {
-            for i in 0..n {
-                let list = &cands[(k * n + j) * n + i];
-                if list.is_empty() {
-                    continue;
-                }
-                let p = [
-                    min[0] + i as Real * h,
-                    min[1] + j as Real * h,
-                    min[2] + k as Real * h,
-                ];
-                let (_d, t, feat, cp) = m.closest_among(p, list);
-                let v = m.signed_from_feature(p, t, feat, cp) as f32;
-                // 站点过滤:扩展 AABB 的盒角格离三角形可达数格(带厚达 ~8 格),
-                // 只留 |phi| ≤ 1.5h 的贴表面薄带作站点 —— EDT 量的才是"到表面距离"。
-                phi[(k * n + j) * n + i] = if v.abs() <= 1.5 * h as f32 { v } else { INF32 };
+    {
+        let plane = n * n;
+        let ppw = n.div_ceil(crate::nthreads()).max(1);
+        let chunks: Vec<&mut [f32]> = phi.chunks_mut(ppw * plane).collect();
+        let cands: &[Vec<u32>] = cands;
+        std::thread::scope(|sc| {
+            for (w, chunk) in chunks.into_iter().enumerate() {
+                let k0 = w * ppw;
+                sc.spawn(move || {
+                    for (idx, slot) in chunk.iter_mut().enumerate() {
+                        let k = k0 + idx / plane;
+                        let rem = idx % plane;
+                        let (j, i) = (rem / n, rem % n);
+                        let list = &cands[(k * n + j) * n + i];
+                        if list.is_empty() {
+                            continue;
+                        }
+                        let p = [
+                            min[0] + i as Real * h,
+                            min[1] + j as Real * h,
+                            min[2] + k as Real * h,
+                        ];
+                        let (_d, t, feat, cp) = m.closest_among(p, list);
+                        let v = m.signed_from_feature(p, t, feat, cp) as f32;
+                        // 站点过滤:扩展 AABB 的盒角格离三角形可达数格(带厚达 ~8 格),
+                        // 只留 |phi| ≤ 1.5h 的贴表面薄带作站点 —— EDT 量的才是"到表面距离"。
+                        *slot = if v.abs() <= 1.5 * h as f32 { v } else { INF32 };
+                    }
+                });
             }
-        }
+        });
     }
     // ── ③ 精确欧氏距离变换(Felzenszwalb & Huttenlocher 2012,自实现)──
     // 站点 = 种子带格点(phi 有限);三轴 1D 下抛物线包络合成,O(N) 且精确
