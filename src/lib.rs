@@ -236,12 +236,17 @@ impl LatticeCache {
 
     #[inline]
     fn key_of(&self, p: [Real; 3]) -> [u32; 3] {
+        // 手写"四舍五入 + 钳位",不用 f64::round():x86-64 基线下 round 是 libm
+        // 导入调用(VTune:round + thunk 合计占构建 CPU ~5%),而 h_min 侧每次查询
+        // 都要算 3 次。语义等价:非负输入下 `+0.5 再截断` 即 round();负数经
+        // float→int 饱和转换落到 0,与原 `.max(0.0)` 一致。
         let hi = self.nkey - 1;
-        [
-            (((p[0] - self.min[0]) / self.h_min).round().max(0.0).min(hi as Real)) as u32,
-            (((p[1] - self.min[1]) / self.h_min).round().max(0.0).min(hi as Real)) as u32,
-            (((p[2] - self.min[2]) / self.h_min).round().max(0.0).min(hi as Real)) as u32,
-        ]
+        let mut k = [0u32; 3];
+        for a in 0..3 {
+            let t = (p[a] - self.min[a]) / self.h_min + 0.5;
+            k[a] = if t >= hi as Real + 0.5 { hi } else { t as u32 };
+        }
+        k
     }
     #[inline]
     fn page_idx(&self, k: [u32; 3]) -> usize {
@@ -390,10 +395,12 @@ impl BakeGrid {
     /// 最近邻采样(域外钳制到边界值)
     #[inline]
     pub fn sample_nearest(&self, p: [Real; 3]) -> Real {
+        // 同 key_of:避免 libm round 调用(每次查询 3 次)
+        let nmax = self.n - 1;
         let mut g = [0usize; 3];
         for a in 0..3 {
-            let t = ((p[a] - self.min[a]) / self.h).round();
-            g[a] = t.clamp(0.0, (self.n - 1) as Real) as usize;
+            let t = (p[a] - self.min[a]) / self.h + 0.5;
+            g[a] = if t >= nmax as Real + 0.5 { nmax } else { t as usize };
         }
         self.data[self.idx(g[0], g[1], g[2])] as Real
     }
@@ -2993,7 +3000,7 @@ pub mod meshfield {
             // pop 的 sift 另占 ~34%。种子已紧(粗距 + 2.5h_c 上界),`d2 >= best` 剪枝
             // 与 best-first 排除的是同一批子树,故**遍历结果相同**;DFS 前沿只有 O(树深),
             // 固定数组即可,免分配、免 sift。近子后入栈 ⟹ 近子先展开(先收紧 best)。
-            const DFS_CAP: usize = 256; // ≥ 2× 最大树深
+            const DFS_CAP: usize = 64; // ≥ 2× 最大树深
             let mut stack = [(0.0f64, 0u32); DFS_CAP];
             let mut sp = 1usize;
             stack[0] = (0.0, self.root);

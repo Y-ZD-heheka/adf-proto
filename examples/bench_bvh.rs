@@ -102,8 +102,24 @@ fn main() {
         }
     }
 
-    // ── 2) 多线程扩展:同一批查询,拆给 T 个工人 ──
-    println!("[扩展性] 同一批 {} 查询 × 不同工人数:", n_pts);
+    // ── 1b) 种子松紧的影响:当前用 网格+2.5h_c;若能拿到更紧的上界会快多少? ──
+    //      (模拟"热启动":用上一次查询的结果或相邻格点值作 best 初值)
+    println!("[种子松紧] 同一批点,seed = 真值 + slack:");
+    for slack in [2.5 * h_c, 0.25 * h_c, 0.02 * h_c, 0.0] {
+        let mut sum = 0.0f64;
+        for (i, &p) in pts.iter().enumerate() {
+            let d = unseeded[i].0 + slack;
+            let s = Instant::now();
+            let _ = field.closest_features_seeded(p, d * d);
+            sum += s.elapsed().as_secs_f64();
+        }
+        println!(
+            "  slack {slack:>7.3}mm | 均 {:>8.2}µs",
+            sum * 1e6 / n_pts as f64
+        );
+    }
+
+    // ── 2) 多线程扩展:同一批查询,拆给 T 个工人 ──    println!("[扩展性] 同一批 {} 查询 × 不同工人数:", n_pts);
     for nt in [1usize, 4, 8, 16, 24] {
         let t = Instant::now();
         let chunk = n_pts.div_ceil(nt);
