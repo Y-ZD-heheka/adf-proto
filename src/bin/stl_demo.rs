@@ -208,12 +208,20 @@ fn main() {
         let err2: f64 = std::env::var("ADF_ERR2").ok().and_then(|v| v.parse().ok()).unwrap_or(1e-4);
         let t = Instant::now();
         let nt0 = mesh.tris.len();
-        let nc = mesh.decimate(err2, 25.0, 0);
+        // 特征保护角(ADF_FEAT_DEG,默认 25°):planar-pair 约束的边阈值
+        let feat_deg: f64 = std::env::var("ADF_FEAT_DEG").ok().and_then(|v| v.parse().ok()).unwrap_or(25.0);
+        let nc = mesh.decimate(err2, feat_deg, 0);
         println!(
             "[decimate] {:?} | 塌缩 {nc} 边 | 三角 {nt0} → {}",
             t.elapsed(),
             mesh.tris.len()
         );
+        // 脊线重吸附(消除锐边锯齿阶梯的短黑线;见 stl_roundtrip 注释)
+        if std::env::var("ADF_NO_SNAP2").is_err() {
+            let ns = mesh.snap_sharp_to_rim(&adf, 0.5, 0.95);
+            let nsl = mesh.collapse_slivers(0.015, 4);
+            println!("[snap2] 重吸附 {ns} 锐边顶点,清薄片 {nsl}");
+        }
     }
     let vol_out = mesh.signed_volume().abs();
     let dev = if vol_in > 0.0 { (vol_out - vol_in) / vol_in * 100.0 } else { 0.0 };

@@ -109,13 +109,24 @@ fn main() {
         let err2: f64 = std::env::var("ADF_ERR2").ok().and_then(|v| v.parse().ok()).unwrap_or(1e-4);
         let t4 = Instant::now();
         let nt0 = mesh.tris.len();
-        let nc = mesh.decimate(err2, 25.0, 0);
+        // 特征保护角(ADF_FEAT_DEG,默认 25°):planar-pair 约束的边阈值
+        let feat_deg: f64 = std::env::var("ADF_FEAT_DEG").ok().and_then(|v| v.parse().ok()).unwrap_or(25.0);
+        let nc = mesh.decimate(err2, feat_deg, 0);
         println!(
             "[decimate] {:?} | 塌缩 {nc} 边 | 三角 {nt0} → {} | 文件 ≈{} MB",
             t4.elapsed(),
             mesh.tris.len(),
             mesh.tris.len() * 50 / 1024 / 1024
         );
+        // 脊线重吸附:decimate 对锐边放宽阈值合并锯齿阶梯(否则满屏短黑线),
+        // 合并点残余偏移由强吸附拉回原始缘线 → 脊线成长段光滑折线。
+        if std::env::var("ADF_NO_SNAP2").is_err() {
+            let t5 = Instant::now();
+            let ns = mesh.snap_sharp_to_rim(&adf, 0.5, 0.95);
+            // 吸附把锐边顶点拉回缘线,邻接窄带三角被挤扁 → 清理针状薄片
+            let nsl = mesh.collapse_slivers(0.015, 4);
+            println!("[snap2] {:?} | 重吸附 {ns} 锐边顶点,清薄片 {nsl}", t5.elapsed());
+        }
     }
     let (open, nonman, comps) = mesh.edge_stats();
     let vol = mesh.signed_volume().abs();
