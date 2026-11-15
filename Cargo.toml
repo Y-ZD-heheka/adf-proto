@@ -1,0 +1,25 @@
+[package]
+name = "adf-proto"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT OR Apache-2.0"
+description = "ADF(自适应采样距离场)最小原型 —— 调研报告 §8.10/§5.15 的 spike"
+# 第三方依赖:零(纯 std)。自研原则下的最严格边界;若将来引入依赖,
+# 按 CNCSIM 纪律:精确锁定最新稳定版 version = "=x.y.z",禁用 ^ 区间。
+
+[lib]
+name = "adf_proto"
+path = "src/lib.rs"
+
+[[bin]]
+name = "adf-demo"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[[bin]]
+name = "stl-demo"
+path = "src/bin/stl_demo.rs"
