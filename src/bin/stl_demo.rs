@@ -203,6 +203,18 @@ fn main() {
         let (nc, nr) = mesh.repair_folds(&adf, 0.5, 0.004, 0.002, h_ext as f64 * 4.0, 20);
         println!("[repair] {:?} | 塌缩 {nc} 边,删三角 {nr}", t.elapsed());
     }
+    // QEM 自适应简化:平坦区大三角、特征区密三角(ADF_ERR2=平方误差 mm²,默认 1e-4)
+    if std::env::var("ADF_NO_DEC").is_err() {
+        let err2: f64 = std::env::var("ADF_ERR2").ok().and_then(|v| v.parse().ok()).unwrap_or(1e-4);
+        let t = Instant::now();
+        let nt0 = mesh.tris.len();
+        let nc = mesh.decimate(err2, 25.0, 0);
+        println!(
+            "[decimate] {:?} | 塌缩 {nc} 边 | 三角 {nt0} → {}",
+            t.elapsed(),
+            mesh.tris.len()
+        );
+    }
     let vol_out = mesh.signed_volume().abs();
     let dev = if vol_in > 0.0 { (vol_out - vol_in) / vol_in * 100.0 } else { 0.0 };
     println!(

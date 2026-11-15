@@ -3435,6 +3435,486 @@ pub mod nets {
             (total_collapsed, total_removed)
         }
 
+        /// **QEM 自适应简化**(Garland–Heckbert 二次型误差 + 特征边平面对约束)。
+        ///
+        /// 平坦区域二次型误差增长慢 → 大步塌缩成大三角;叶缘/锐边处误差陡增
+        /// → 三角保持细密 —— "按需调整面片大小",体积缩小而形状误差有界。
+        /// 塌缩安全性:链接条件(防非流形)+ 邻面法线翻转检查(防折叠)+
+        /// 误差阈值 `err2_max`(几何误差的硬上限,单位 mm²)。
+        /// 特征保持:二面角 > `feature_deg` 的边,向两端点额外添加相邻两面
+        /// 平面约束(标准 planar-pair),缘线顶点几乎不动。
+        ///
+        /// `err2_max`: 允许的平方误差上限(mm²),如 0.0004 ≈ 0.02mm 弦差;
+        /// `feature_deg`: 特征边二面角阈值;`target_tris`: 0 = 纯误差驱动。
+        /// 返回(塌缩次数, 简化后三角数)。
+        pub fn decimate(&mut self, err2_max: f64, feature_deg: f64, target_tris: usize) -> usize {
+            let n_t0 = self.tris.len();
+            let nv = self.verts.len();
+            // ── 1) 面平面 + 顶点二次型 ──
+            // 对称 4×4 存 10 元:[q00 q01 q02 q03 q11 q12 q13 q22 q23 q33]
+            let zero_q = [0.0f64; 10];
+            let mut q: Vec<[f64; 10]> = vec![zero_q; nv];
+            let add_plane = |qv: &mut [f64; 10], n: [f64; 3], d: f64| {
+                let p = [n[0], n[1], n[2], d];
+                let mut k = 0usize;
+                for r in 0..4 {
+                    for c in r..4 {
+                        qv[k] += p[r] * p[c];
+                        k += 1;
+                    }
+                }
+            };
+            // 面法线缓存(翻转检查用)
+            let mut tri_n: Vec<[f64; 3]> = vec![[0.0; 3]; n_t0];
+            for (ti, t) in self.tris.iter().enumerate() {
+                let (a, b, c) = (
+                    self.verts[t[0] as usize],
+                    self.verts[t[1] as usize],
+                    self.verts[t[2] as usize],
+                );
+                let (a, b, c) = (
+                    [a[0] as f64, a[1] as f64, a[2] as f64],
+                    [b[0] as f64, b[1] as f64, b[2] as f64],
+                    [c[0] as f64, c[1] as f64, c[2] as f64],
+                );
+                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                let cr = [
+                    ab[1] * ac[2] - ab[2] * ac[1],
+                    ab[2] * ac[0] - ab[0] * ac[2],
+                    ab[0] * ac[1] - ab[1] * ac[0],
+                ];
+                let l = (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]).sqrt();
+                if l < 1e-12 {
+                    continue;
+                }
+                let n = [cr[0] / l, cr[1] / l, cr[2] / l];
+                tri_n[ti] = n;
+                let d = -(n[0] * a[0] + n[1] * a[1] + n[2] * a[2]);
+                for &vi in t.iter() {
+                    add_plane(&mut q[vi as usize], n, d);
+                }
+            }
+            // ── 2) 特征边平面对约束 ──
+            {
+                let mut emap: std::collections::HashMap<u64, [u32; 3], FxBuild> =
+                    std::collections::HashMap::with_capacity_and_hasher(n_t0 * 3, FxBuild);
+                for (ti, t) in self.tris.iter().enumerate() {
+                    for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                        let key = if a < b {
+                            ((a as u64) << 32) | b as u64
+                        } else {
+                            ((b as u64) << 32) | a as u64
+                        };
+                        let e = emap.entry(key).or_insert([u32::MAX, u32::MAX, 0u32]);
+                        if e[0] == u32::MAX {
+                            e[0] = ti as u32;
+                        } else if e[1] == u32::MAX {
+                            e[1] = ti as u32;
+                        }
+                        e[2] += 1;
+                    }
+                }
+                let cos_feat = (feature_deg as f64).to_radians().cos();
+                for (key, ts) in emap.iter() {
+                    if ts[2] != 2 {
+                        continue;
+                    }
+                    let (t0, t1) = (ts[0] as usize, ts[1] as usize);
+                    let d = tri_n[t0][0] * tri_n[t1][0]
+                        + tri_n[t0][1] * tri_n[t1][1]
+                        + tri_n[t0][2] * tri_n[t1][2];
+                    if d >= cos_feat {
+                        continue;
+                    }
+                    // 特征约束:相邻两面平面对(面约束重复计入)→ 两端点
+                    let feat_planes = |out: &mut Vec<([f64; 3], f64)>, ti: usize| {
+                        let n = tri_n[ti];
+                        let t = self.tris[ti];
+                        let p0 = self.verts[t[0] as usize];
+                        let dd = -(n[0] * p0[0] as f64 + n[1] * p0[1] as f64 + n[2] * p0[2] as f64);
+                        out.push((n, dd));
+                    };
+                    let mut planes = Vec::with_capacity(2);
+                    feat_planes(&mut planes, t0);
+                    feat_planes(&mut planes, t1);
+                    let a = (key >> 32) as u32;
+                    let b = (key & 0xffff_ffff) as u32;
+                    for (n, dd) in planes.iter() {
+                        add_plane(&mut q[a as usize], *n, *dd);
+                        add_plane(&mut q[b as usize], *n, *dd);
+                    }
+                }
+            }
+            // ── 3) 顶点 → 三角邻接(CSR 不行——塌缩要动态增删,用 Vec<Vec>)──
+            let mut v2t: Vec<Vec<u32>> = vec![Vec::new(); nv];
+            for (ti, t) in self.tris.iter().enumerate() {
+                for k in 0..3 {
+                    v2t[t[k] as usize].push(ti as u32);
+                }
+            }
+            // ── 4) 边堆(懒失效:顶点版本号)──
+            let mut ver = vec![0u32; nv];
+            let mut dead_tri = vec![false; n_t0];
+            let quad_eval = |qv: &[f64; 10], v: [f64; 3]| -> f64 {
+                let x = [v[0], v[1], v[2], 1.0];
+                let mut s = 0.0;
+                let mut k = 0usize;
+                for r in 0..4 {
+                    for c in r..4 {
+                        s += qv[k] * x[r] * x[c] * if r == c { 1.0 } else { 2.0 };
+                        k += 1;
+                    }
+                }
+                s
+            };
+            // 4×4 线性求解(Q 对称,底行 [0 0 0 1];列主元高斯)
+            let solve_pos = |qq: &[f64; 10]| -> Option<[f64; 3]> {
+                // 完整 4×4
+                let idx = [0usize, 1, 2, 3, 4, 5, 6, 7, 8];
+                let _ = idx;
+                let mut m = [
+                    [qq[0], qq[1], qq[2], qq[3], 0.0],
+                    [qq[1], qq[4], qq[5], qq[6], 0.0],
+                    [qq[2], qq[5], qq[7], qq[8], 0.0],
+                    [0.0, 0.0, 0.0, 1.0, 1.0],
+                ];
+                // 高斯消元(部分主元)
+                for col in 0..4 {
+                    let mut piv = col;
+                    for r in (col + 1)..4 {
+                        if m[r][col].abs() > m[piv][col].abs() {
+                            piv = r;
+                        }
+                    }
+                    if m[piv][col].abs() < 1e-12 {
+                        return None;
+                    }
+                    m.swap(col, piv);
+                    for r in 0..4 {
+                        if r != col && m[r][col].abs() > 1e-15 {
+                            let f = m[r][col] / m[col][col];
+                            for c in col..5 {
+                                m[r][c] -= f * m[col][c];
+                            }
+                        }
+                    }
+                }
+                let v = [
+                    m[0][4] / m[0][0],
+                    m[1][4] / m[1][1],
+                    m[2][4] / m[2][2],
+                ];
+                if v.iter().all(|x| x.is_finite()) {
+                    Some(v)
+                } else {
+                    None
+                }
+            };
+            let edge_cost = |qa: &[f64; 10], qb: &[f64; 10], pa: [f32; 3], pb: [f32; 3]| -> (f64, [f64; 3]) {
+                let mut qq = [0.0f64; 10];
+                for k in 0..10 {
+                    qq[k] = qa[k] + qb[k];
+                }
+                let af = [pa[0] as f64, pa[1] as f64, pa[2] as f64];
+                let bf = [pb[0] as f64, pb[1] as f64, pb[2] as f64];
+                let mid = [(af[0] + bf[0]) * 0.5, (af[1] + bf[1]) * 0.5, (af[2] + bf[2]) * 0.5];
+                let ab = [bf[0] - af[0], bf[1] - af[1], bf[2] - af[2]];
+                let lab = (ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2]).sqrt();
+                // 滑动钳制:平坦方向二次型几乎无成本,求解位置会被甩出表面
+                // (桌腿实测甩出 5.5mm)——钳到中点邻域 2.5×|ab|,钳后重估成本
+                let clamp_mid = |v: [f64; 3]| -> [f64; 3] {
+                    let d = [v[0] - mid[0], v[1] - mid[1], v[2] - mid[2]];
+                    let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                    let lim = 2.5 * lab;
+                    if l <= lim || l < 1e-12 {
+                        v
+                    } else {
+                        let f = lim / l;
+                        [mid[0] + d[0] * f, mid[1] + d[1] * f, mid[2] + d[2] * f]
+                    }
+                };
+                let cands = [
+                    solve_pos(&qq).map(clamp_mid),
+                    Some(af),
+                    Some(bf),
+                    Some(mid),
+                ];
+                let mut best = (f64::INFINITY, mid);
+                for cv in cands.into_iter().flatten() {
+                    let c = quad_eval(&qq, cv);
+                    if c < best.0 {
+                        best = (c, cv);
+                    }
+                }
+                best
+            };
+            // 初始边集
+            let ord = |c: f64| -> u64 { if c >= 0.0 { c.to_bits() } else { !c.to_bits() } };
+            let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u32, u32, u32, u32)>> =
+                std::collections::BinaryHeap::with_capacity(n_t0 * 2);
+            let mut banned: std::collections::HashSet<u64, FxBuild> =
+                std::collections::HashSet::with_capacity_and_hasher(1024, FxBuild);
+            {
+                let mut seen: std::collections::HashSet<u64, FxBuild> =
+                    std::collections::HashSet::with_capacity_and_hasher(n_t0 * 3, FxBuild);
+                for t in self.tris.iter() {
+                    for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                        let key = if a < b {
+                            ((a as u64) << 32) | b as u64
+                        } else {
+                            ((b as u64) << 32) | a as u64
+                        };
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        let (c, _) = edge_cost(
+                            &q[a as usize],
+                            &q[b as usize],
+                            self.verts[a as usize],
+                            self.verts[b as usize],
+                        );
+                        heap.push(std::cmp::Reverse((ord(c), a, b, ver[a as usize], ver[b as usize])));
+                    }
+                }
+            }
+            // ── 5) 塌缩主循环 ──
+            let mut n_collapsed = 0usize;
+            let mut n_live = n_t0;
+            while let Some(std::cmp::Reverse((cbits, a, b, va, vb))) = heap.pop() {
+                let cost = f64::from_bits(if (cbits >> 63) == 1 { !cbits } else { cbits });
+                if cost > err2_max {
+                    break;
+                }
+                if banned.contains(&(if a < b {
+                    ((a as u64) << 32) | b as u64
+                } else {
+                    ((b as u64) << 32) | a as u64
+                })) {
+                    continue;
+                }
+                if ver[a as usize] != va || ver[b as usize] != vb {
+                    continue; // 懒失效
+                }
+                if n_live <= target_tris && target_tris > 0 {
+                    break;
+                }
+                // 共享边 (a,b) 的活三角必须恰 2
+                let shared: Vec<u32> = {
+                    let sa = &v2t[a as usize];
+                    let sb = &v2t[b as usize];
+                    let (long, short) = if sa.len() < sb.len() { (sb, sa) } else { (sa, sb) };
+                    short
+                        .iter()
+                        .filter(|ti| long.contains(ti) && !dead_tri[**ti as usize])
+                        .copied()
+                        .collect()
+                };
+                if shared.len() != 2 {
+                    continue;
+                }
+                // 链接条件:公共邻点恰为两面相对顶点
+                fn nbrs_of(v2t: &[Vec<u32>], tris: &[[u32; 3]], dead: &[bool], vi: usize) -> Vec<u32> {
+                    let mut s: Vec<u32> = Vec::with_capacity(8);
+                    for &ti in v2t[vi].iter() {
+                        if dead[ti as usize] {
+                            continue;
+                        }
+                        let t = tris[ti as usize];
+                        for k in 0..3 {
+                            if t[k] as usize != vi && !s.contains(&t[k]) {
+                                s.push(t[k]);
+                            }
+                        }
+                    }
+                    s
+                }
+                let (na, nb) = (
+                    nbrs_of(&v2t, &self.tris, &dead_tri, a as usize),
+                    nbrs_of(&v2t, &self.tris, &dead_tri, b as usize),
+                );
+                fn opp_of(tris: &[[u32; 3]], ti: u32, a: u32, b: u32) -> u32 {
+                    let t = tris[ti as usize];
+                    if t[0] != a && t[0] != b {
+                        t[0]
+                    } else if t[1] != a && t[1] != b {
+                        t[1]
+                    } else {
+                        t[2]
+                    }
+                }
+                let want = [opp_of(&self.tris, shared[0], a, b), opp_of(&self.tris, shared[1], a, b)];
+                let common: Vec<u32> = na.iter().filter(|x| nb.contains(x)).copied().collect();
+                if common.len() != 2
+                    || !common.contains(&want[0])
+                    || !common.contains(&want[1])
+                {
+                    continue;
+                }
+                // 最优位置
+                let (cost2, pos) = edge_cost(
+                    &q[a as usize],
+                    &q[b as usize],
+                    self.verts[a as usize],
+                    self.verts[b as usize],
+                );
+                let _ = cost2;
+                // 翻转检查:环绕三角新法线不与旧法线反向
+                let newn = |ti: u32| -> Option<[f64; 3]> {
+                    let t = self.tris[ti as usize];
+                    let mut pv = [[0.0f64; 3]; 3];
+                    for k in 0..3 {
+                        let vi = t[k] as usize;
+                        if vi == b as usize {
+                            pv[k] = pos;
+                        } else {
+                            let p = self.verts[vi];
+                            pv[k] = [p[0] as f64, p[1] as f64, p[2] as f64];
+                        }
+                    }
+                    let ab = [pv[1][0] - pv[0][0], pv[1][1] - pv[0][1], pv[1][2] - pv[0][2]];
+                    let ac = [pv[2][0] - pv[0][0], pv[2][1] - pv[0][1], pv[2][2] - pv[0][2]];
+                    let cr = [
+                        ab[1] * ac[2] - ab[2] * ac[1],
+                        ab[2] * ac[0] - ab[0] * ac[2],
+                        ab[0] * ac[1] - ab[1] * ac[0],
+                    ];
+                    let l = (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]).sqrt();
+                    if l < 1e-12 {
+                        return None;
+                    }
+                    Some([cr[0] / l, cr[1] / l, cr[2] / l])
+                };
+                let mut flip = false;
+                for &ti in v2t[a as usize].iter().chain(v2t[b as usize].iter()) {
+                    if dead_tri[ti as usize] || shared.contains(&ti) {
+                        continue;
+                    }
+                    if let Some(nw) = newn(ti) {
+                        let on = tri_n[ti as usize];
+                        if nw[0] * on[0] + nw[1] * on[1] + nw[2] * on[2] < 0.2 {
+                            flip = true;
+                            break;
+                        }
+                    }
+                }
+                if flip {
+                    // 拒绝塌缩:永久封禁该边(保守;邻域塌缩后仍封禁,
+                    // 避免同条目反复弹出)。封禁不 bump 版本——邻边条目仍有效。
+                    banned.insert(if a < b { ((a as u64) << 32) | b as u64 } else { ((b as u64) << 32) | a as u64 });
+                    continue;
+                }
+                // ── 执行塌缩:b → a ──
+                self.verts[a as usize] = [pos[0] as f32, pos[1] as f32, pos[2] as f32];
+                for k in 0..10 {
+                    q[a as usize][k] += q[b as usize][k];
+                }
+                ver[a as usize] += 1;
+                ver[b as usize] += 1;
+                let mut b_tris = std::mem::take(&mut v2t[b as usize]);
+                for ti in b_tris.iter() {
+                    let t = &mut self.tris[*ti as usize];
+                    for k in 0..3 {
+                        if t[k] == b {
+                            t[k] = a;
+                        }
+                    }
+                }
+                for ti in b_tris.iter() {
+                    if self.tris[*ti as usize][0] == self.tris[*ti as usize][1]
+                        || self.tris[*ti as usize][1] == self.tris[*ti as usize][2]
+                        || self.tris[*ti as usize][0] == self.tris[*ti as usize][2]
+                    {
+                        dead_tri[*ti as usize] = true;
+                        n_live -= 1;
+                    }
+                }
+                // 邻接更新:b 的活三角移入 a;死三角从所有端点移除
+                let mut moved: Vec<u32> = Vec::with_capacity(b_tris.len());
+                for ti in b_tris.iter() {
+                    if !dead_tri[*ti as usize] {
+                        moved.push(*ti);
+                    }
+                }
+                let dead_of_a: Vec<u32> = {
+                    let lst = &v2t[a as usize];
+                    lst.iter().filter(|&ti| dead_tri[*ti as usize]).copied().collect()
+                };
+                for ti in dead_of_a.iter() {
+                    // 从其余两端点的邻接中移除
+                    let t = self.tris[*ti as usize];
+                    for k in 0..3 {
+                        let vi = t[k] as usize;
+                        if vi != a as usize {
+                            v2t[vi].retain(|&x| x != *ti);
+                        }
+                    }
+                }
+                v2t[a as usize].retain(|&x| !dead_tri[x as usize]);
+                for ti in moved.iter() {
+                    let t = self.tris[*ti as usize];
+                    for k in 0..3 {
+                        let vi = t[k] as usize;
+                        if vi != a as usize && !v2t[vi].contains(ti) {
+                            v2t[vi].push(*ti);
+                        }
+                    }
+                    if !v2t[a as usize].contains(ti) {
+                        v2t[a as usize].push(*ti);
+                    }
+                }
+                b_tris.clear();
+                n_collapsed += 1;
+                // 周边边重新入堆
+                for &w in nbrs_of(&v2t, &self.tris, &dead_tri, a as usize).iter() {
+                    if w == a {
+                        continue;
+                    }
+                    let (c, _) = edge_cost(
+                        &q[a as usize],
+                        &q[w as usize],
+                        self.verts[a as usize],
+                        self.verts[w as usize],
+                    );
+                    heap.push(std::cmp::Reverse((
+                        ord(c),
+                        a,
+                        w,
+                        ver[a as usize],
+                        ver[w as usize],
+                    )));
+                }
+            }
+            // ── 6) 压缩 ──
+            let mut remap: Vec<u32> = vec![u32::MAX; nv];
+            let mut newv: Vec<[f32; 3]> = Vec::new();
+            let mut newt: Vec<[u32; 3]> = Vec::with_capacity(n_live);
+            for (ti, t) in self.tris.iter().enumerate() {
+                if !dead_tri.is_empty() && dead_tri[ti] {
+                    continue;
+                }
+                let mut nt = [0u32; 3];
+                let mut ok = true;
+                for k in 0..3 {
+                    let vi = t[k] as usize;
+                    if remap[vi] == u32::MAX {
+                        remap[vi] = newv.len() as u32;
+                        newv.push(self.verts[vi]);
+                    }
+                    nt[k] = remap[vi];
+                }
+                if nt[0] == nt[1] || nt[1] == nt[2] || nt[0] == nt[2] {
+                    ok = false;
+                }
+                if ok {
+                    newt.push(nt);
+                }
+            }
+            self.tris = newt;
+            self.verts = newv;
+            n_collapsed
+        }
+
         /// 丢弃**碎屑分量**:三角数 < `min_tris`,**或**体积 < `min_vol_frac` × 总体积。
         /// 这类分量是场里孤立的小符号岛,在查看器里表现为浮在表面的斑点;切片软件
         /// 通常也直接忽略。用"相对体积"而不只看三角数,是因为三角数与网格密度挂钩

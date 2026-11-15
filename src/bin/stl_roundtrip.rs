@@ -103,6 +103,20 @@ fn main() {
             t3.elapsed()
         );
     }
+    // QEM 自适应简化:平坦区大三角、缘带密三角("按需面片")。
+    // ADF_ERR2=平方误差上限 mm²(默认 4e-4 ≈ 0.02mm 弦差);ADF_NO_DEC=1 跳过。
+    if std::env::var("ADF_NO_DEC").is_err() {
+        let err2: f64 = std::env::var("ADF_ERR2").ok().and_then(|v| v.parse().ok()).unwrap_or(1e-4);
+        let t4 = Instant::now();
+        let nt0 = mesh.tris.len();
+        let nc = mesh.decimate(err2, 25.0, 0);
+        println!(
+            "[decimate] {:?} | 塌缩 {nc} 边 | 三角 {nt0} → {} | 文件 ≈{} MB",
+            t4.elapsed(),
+            mesh.tris.len(),
+            mesh.tris.len() * 50 / 1024 / 1024
+        );
+    }
     let (open, nonman, comps) = mesh.edge_stats();
     let vol = mesh.signed_volume().abs();
     println!(
