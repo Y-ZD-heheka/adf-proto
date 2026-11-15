@@ -179,7 +179,7 @@ fn main() {
     let hf_mult: Real = std::env::var("ADF_H_EXT").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
     let h_ext = h_min * hf_mult;
     let t = Instant::now();
-    let mesh = nets::extract_uniform(&adf, h_ext);
+    let mut mesh = nets::extract_uniform(&adf, h_ext);
     println!(
         "[nets] h={h_ext:.4}({hf_mult}×h_min) 提取 {:?} | 顶点 {} 三角 {}",
         t.elapsed(),
@@ -196,6 +196,12 @@ fn main() {
                 _ => " → **有开口**",
             }
         );
+    }
+    // 折叠/薄片修复:边缘"破损"的真身,塌缩最短边消除
+    if std::env::var("ADF_REPAIR").is_ok() {
+        let t = Instant::now();
+        let (nc, nr) = mesh.repair_folds(&adf, 0.5, 0.004, 0.002, h_ext as f64 * 4.0, 20);
+        println!("[repair] {:?} | 塌缩 {nc} 边,删三角 {nr}", t.elapsed());
     }
     let vol_out = mesh.signed_volume().abs();
     let dev = if vol_in > 0.0 { (vol_out - vol_in) / vol_in * 100.0 } else { 0.0 };

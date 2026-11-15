@@ -84,12 +84,25 @@ fn main() {
         println!("[clean] 丢弃碎屑分量 {nd} 个 / 三角 {nt}");
     }
     // 平滑 + 投影回零等值面:削掉叶边处的扇贝锯齿(位移上限 = 半格)
-    let t2 = Instant::now();
-    let (dm, dx) = mesh.smooth_and_project(&adf, 3, h_ext as f32 * 0.5);
-    println!(
-        "[smooth] {:?} | 位移 mean {dm:.4} max {dx:.4} mm",
-        t2.elapsed()
-    );
+    if std::env::var("ADF_NO_SMOOTH").is_err() {
+        let t2 = Instant::now();
+        let (dm, dx) = mesh.smooth_and_project(&adf, 3, h_ext as f32 * 0.5);
+        println!(
+            "[smooth] {:?} | 位移 mean {dm:.4} max {dx:.4} mm",
+            t2.elapsed()
+        );
+    } else {
+        println!("[smooth] ADF_NO_SMOOTH=1 → 跳过平滑/投影/吸附(原始提取输出)");
+    }
+    // 折叠/薄片修复:边缘"破损"的真身(真折叠 + 针状薄片),塌缩最短边消除
+    if std::env::var("ADF_REPAIR").is_ok() {
+        let t3 = Instant::now();
+        let (nc, nr) = mesh.repair_folds(&adf, 0.5, 0.004, 0.002, h_ext as f64 * 4.0, 20);
+        println!(
+            "[repair] {:?} | 塌缩 {nc} 边,删三角 {nr}",
+            t3.elapsed()
+        );
+    }
     let (open, nonman, comps) = mesh.edge_stats();
     let vol = mesh.signed_volume().abs();
     println!(

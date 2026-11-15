@@ -2800,7 +2800,8 @@ pub mod nets {
             // 0.5mm),把顶点 70% 吸附到该特征的真实位置——边缘线回归原始
             // 几何,锯齿消失。部分吸附(0.7)避免侧面顶部顶点与边线顶点
             // 完全重合产生退化三角。非锐边顶点不查询(免误吸 + 省 90% 时延)。
-            if let BaseField::Mesh(m) = &adf.field.base {
+            let no_snap = std::env::var("ADF_NO_SNAP").is_ok();
+            if !no_snap && let BaseField::Mesh(m) = &adf.field.base {
                 // 边 → 相邻两面
                 let mut face_of: std::collections::HashMap<(u32, u32), [u32; 2]> =
                     std::collections::HashMap::with_capacity(n * 3);
@@ -3054,6 +3055,384 @@ pub mod nets {
                 self.verts[i] = [p[i][0] as f32, p[i][1] as f32, p[i][2] as f32];
             }
             (sum / n as f64, mx)
+        }
+
+        /// **折叠与薄片修复**:叶轮边缘的"破损/缺口"指纹是两类退化结构——
+        /// ①真折叠:相邻两面法线夹角 >60° 且一方顶点穿到对方平面背后
+        ///   (叶轮实测 10,423 对,穿透深度 p50 0.054mm;提取在脊边处的
+        ///   三线性插值零面自身振荡 + 平滑/吸附的顶点移动越过缘顶);
+        /// ②薄片:最小高度 = 2·面积/最长边 ≈ 0 的针状三角(法线随机,
+        ///   渲染成边缘黑点,f32 导出后可能变孔洞)。
+        /// 两者都通过**塌缩其最短边**消除(合并两点→两面退化删除,无洞)。
+        ///
+        /// 折叠判定用**场梯度仲裁**:折叠面的法线与局部场梯度(外向)反向,
+        /// 而合法凹角/凸角两面的法线都与梯度同向——纯几何判据(顶点异侧)
+        /// 会把凹角误当折叠(凹角顶点也在邻面平面背后)。只对二面角 >60°
+        /// 的边做场查询(约 2 万条),代价 ~1s。
+        ///
+        /// 塌缩安全:链接条件(两顶点公共邻点恰为被删两面的对顶点,否则
+        /// 制造非流形)+ 每 pass 候选顶点不相交 + 边长 < max_edge 守卫。
+        /// 返回(塌缩次数, 删除三角数)。
+        pub fn repair_folds(
+            &mut self,
+            adf: &Adf,
+            fold_cos: f64,
+            _pen_margin: f64,
+            sliver_h: f64,
+            max_edge: f64,
+            passes: usize,
+        ) -> (usize, usize) {
+            let mut total_collapsed = 0usize;
+            let mut total_removed = 0usize;
+            let hstep = (1e-3 * adf.size) as f64;
+            for _p in 0..passes {
+                let n_t = self.tris.len();
+                let nv = self.verts.len();
+                // 面法线 / 2·面积 / 质心 / 最小高度
+                let mut tn = vec![[0.0f64; 3]; n_t];
+                let mut ta2 = vec![0.0f64; n_t];
+                let mut hc = vec![[0.0f64; 3]; n_t];
+                let mut hmin = vec![f64::INFINITY; n_t];
+                for (ti, t) in self.tris.iter().enumerate() {
+                    let (a, b, c) = (
+                        self.verts[t[0] as usize],
+                        self.verts[t[1] as usize],
+                        self.verts[t[2] as usize],
+                    );
+                    let (a, b, c) = (
+                        [a[0] as f64, a[1] as f64, a[2] as f64],
+                        [b[0] as f64, b[1] as f64, b[2] as f64],
+                        [c[0] as f64, c[1] as f64, c[2] as f64],
+                    );
+                    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                    let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                    let bc = [c[0] - b[0], c[1] - b[1], c[2] - b[2]];
+                    let cr = [
+                        ab[1] * ac[2] - ab[2] * ac[1],
+                        ab[2] * ac[0] - ab[0] * ac[2],
+                        ab[0] * ac[1] - ab[1] * ac[0],
+                    ];
+                    let l = (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]).sqrt();
+                    ta2[ti] = l;
+                    tn[ti] = if l > 1e-20 {
+                        [cr[0] / l, cr[1] / l, cr[2] / l]
+                    } else {
+                        [0.0; 3]
+                    };
+                    hc[ti] = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
+                    let e1 = (ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2]).sqrt();
+                    let e2 = (ac[0] * ac[0] + ac[1] * ac[1] + ac[2] * ac[2]).sqrt();
+                    let e3 = (bc[0] * bc[0] + bc[1] * bc[1] + bc[2] * bc[2]).sqrt();
+                    let emax = e1.max(e2).max(e3);
+                    hmin[ti] = if emax > 1e-12 { l / emax } else { 0.0 };
+                }
+                // 顶点 → 三角
+                let mut v2t: Vec<Vec<u32>> = vec![Vec::new(); nv];
+                for (ti, t) in self.tris.iter().enumerate() {
+                    for k in 0..3 {
+                        v2t[t[k] as usize].push(ti as u32);
+                    }
+                }
+                // 边 → [tri0, tri1, 计数](计数 != 2 = 开放边或非流形边,候选跳过)
+                let mut e2t: std::collections::HashMap<u64, [u32; 3], FxBuild> =
+                    std::collections::HashMap::with_capacity_and_hasher(n_t * 3, FxBuild);
+                for (ti, t) in self.tris.iter().enumerate() {
+                    for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                        let key = if a < b {
+                            ((a as u64) << 32) | b as u64
+                        } else {
+                            ((b as u64) << 32) | a as u64
+                        };
+                        let e = e2t.entry(key).or_insert([u32::MAX, u32::MAX, 0u32]);
+                        if e[0] == u32::MAX {
+                            e[0] = ti as u32;
+                        } else if e[1] == u32::MAX {
+                            e[1] = ti as u32;
+                        }
+                        e[2] += 1;
+                    }
+                }
+                // 场梯度(惰性:只对候选面查询)
+                let grad = |q: [f64; 3]| -> [f64; 3] {
+                    let q = [q[0] as Real, q[1] as Real, q[2] as Real];
+                    let d0 = adf.eval(q) as f64;
+                    let mut g = [0.0f64; 3];
+                    for k in 0..3 {
+                        let mut qq = q;
+                        qq[k] += hstep;
+                        g[k] = (adf.eval(qq) as f64 - d0) / hstep;
+                    }
+                    g
+                };
+                // bad 标记:薄片(无条件)+ 折叠(法线与场梯度反向)
+                let mut bad = vec![false; n_t];
+                let mut n_sliver = 0usize;
+                for ti in 0..n_t {
+                    if hmin[ti] < sliver_h {
+                        bad[ti] = true;
+                        n_sliver += 1;
+                    }
+                }
+                let mut n_fold = 0usize;
+                for (&ekey, ts) in e2t.iter() {
+                    if ts[2] != 2 {
+                        continue;
+                    }
+                    let (t0, t1) = (ts[0] as usize, ts[1] as usize);
+                    let d = tn[t0][0] * tn[t1][0] + tn[t0][1] * tn[t1][1] + tn[t0][2] * tn[t1][2];
+                    if d >= fold_cos {
+                        continue;
+                    }
+                    // 梯度在**共享边中点**求值:脊线处梯度 = 两面法线的角平分方向,
+                    // 折叠面(法线翻过脊顶)与它必呈钝角;合法凸/凹角两面都在
+                    // ±90° 锥内。质心求值会被脊顶另一侧的梯度翻转干扰(实测漏检)。
+                    let (ea, eb) = ((ekey >> 32) as u32, ekey as u32);
+                    let pa = self.verts[ea as usize];
+                    let pb = self.verts[eb as usize];
+                    let mid = [
+                        (pa[0] as f64 + pb[0] as f64) * 0.5,
+                        (pa[1] as f64 + pb[1] as f64) * 0.5,
+                        (pa[2] as f64 + pb[2] as f64) * 0.5,
+                    ];
+                    let g = grad(mid);
+                    for &t in &[t0, t1] {
+                        if bad[t] {
+                            continue;
+                        }
+                        if tn[t][0] * g[0] + tn[t][1] * g[1] + tn[t][2] * g[2] < 0.3 {
+                            bad[t] = true;
+                            n_fold += 1;
+                        }
+                    }
+                }
+                if n_fold == 0 && n_sliver == 0 {
+                    break;
+                }
+                eprintln!(
+                    "[repair] pass {}: 薄片 {n_sliver} 折叠 {n_fold}",
+                    _p + 1
+                );
+                // 候选塌缩:bad 三角的最短边(u,v),死两面 = 共享 (u,v) 的两面
+                let mut used_v = vec![false; nv];
+                let mut used_t = vec![false; n_t];
+                let mut uf: Vec<u32> = (0..nv as u32).collect();
+                fn ufind(p: &mut [u32], mut x: u32) -> u32 {
+                    while p[x as usize] != x {
+                        p[x as usize] = p[p[x as usize] as usize];
+                        x = p[x as usize];
+                    }
+                    x
+                }
+                let mut pos: Vec<[f64; 3]> = self
+                    .verts
+                    .iter()
+                    .map(|v| [v[0] as f64, v[1] as f64, v[2] as f64])
+                    .collect();
+                let mut n_collapsed = 0usize;
+                let mut merged_roots: Vec<u32> = Vec::new();
+                for (&_key, &ts) in e2t.iter() {
+                    if ts[2] != 2 {
+                        continue;
+                    }
+                    let (t0, t1) = (ts[0] as usize, ts[1] as usize);
+                    // 选 bad 三角(两面都 bad 时选面积小的)
+                    let tb = if bad[t0] && bad[t1] {
+                        if ta2[t0] <= ta2[t1] { t0 } else { t1 }
+                    } else if bad[t0] {
+                        t0
+                    } else if bad[t1] {
+                        t1
+                    } else {
+                        continue;
+                    };
+                    if used_t[tb] {
+                        continue;
+                    }
+                    // bad 三角三边,取"两端点都未用且最短"的边(key 归一化与 e2t 一致)
+                    let tri = self.tris[tb];
+                    let mut best = (u64::MAX, 0u32, 0u32, f64::INFINITY);
+                    for k in 0..3 {
+                        let (x, y) = (tri[k], tri[(k + 1) % 3]);
+                        if used_v[x as usize] || used_v[y as usize] {
+                            continue;
+                        }
+                        let d = {
+                            let dx = pos[x as usize][0] - pos[y as usize][0];
+                            let dy = pos[x as usize][1] - pos[y as usize][1];
+                            let dz = pos[x as usize][2] - pos[y as usize][2];
+                            (dx * dx + dy * dy + dz * dz).sqrt()
+                        };
+                        if d < best.3 {
+                            let ekey = if x < y {
+                                ((x as u64) << 32) | y as u64
+                            } else {
+                                ((y as u64) << 32) | x as u64
+                            };
+                            best = (ekey, x, y, d);
+                        }
+                    }
+                    if best.0 == u64::MAX || best.3 > max_edge {
+                        continue;
+                    }
+                    // 共享该边的两面(即死面)
+                    let (da, db) = match e2t.get(&best.0) {
+                        Some(s) if s[2] == 2 => (s[0] as usize, s[1] as usize),
+                        _ => continue,
+                    };
+                    if used_t[da] || used_t[db] {
+                        continue;
+                    }
+                    let (u, v) = (best.1 as usize, best.2 as usize);
+                    // 链接条件:u,v 公共邻点恰为死两面的对顶点
+                    let apex_of = |t: usize| -> u32 {
+                        let tt = self.tris[t];
+                        if tt[0] != u as u32 && tt[0] != v as u32 {
+                            tt[0]
+                        } else if tt[1] != u as u32 && tt[1] != v as u32 {
+                            tt[1]
+                        } else {
+                            tt[2]
+                        }
+                    };
+                    let want = [apex_of(da), apex_of(db)];
+                    let mut common: Vec<u32> = Vec::new();
+                    for &ti in v2t[u].iter() {
+                        let tt = self.tris[ti as usize];
+                        for k in 0..3 {
+                            let w = tt[k];
+                            if w as usize == u || w as usize == v {
+                                continue;
+                            }
+                            if v2t[v].iter().any(|&tj| {
+                                let t2 = self.tris[tj as usize];
+                                t2[0] == w || t2[1] == w || t2[2] == w
+                            }) && !common.contains(&w)
+                            {
+                                common.push(w);
+                            }
+                        }
+                    }
+                    if common.len() != 2
+                        || !common.contains(&want[0])
+                        || !common.contains(&want[1])
+                    {
+                        continue;
+                    }
+                    // 1-环保留:塌缩影响 u/v 的全部邻接三角;若环内有其他候选
+                    // 已用的顶点,两个塌缩会在同一 pass 内相互作用(候选校验
+                    // 基于 pass 开始快照,相互作用会制造非流形边,实测 +93)。
+                    // 保留整个 1-环后,本 pass 塌缩彼此完全隔离。
+                    let mut ring_conflict = false;
+                    for &ti in v2t[u].iter().chain(v2t[v].iter()) {
+                        let tt = self.tris[ti as usize];
+                        for k in 0..3 {
+                            if used_v[tt[k] as usize] {
+                                ring_conflict = true;
+                                break;
+                            }
+                        }
+                        if ring_conflict {
+                            break;
+                        }
+                    }
+                    if ring_conflict {
+                        continue;
+                    }
+                    // 执行塌缩:u 并入 v(中点),死两面
+                    let mid = [
+                        (pos[u][0] + pos[v][0]) * 0.5,
+                        (pos[u][1] + pos[v][1]) * 0.5,
+                        (pos[u][2] + pos[v][2]) * 0.5,
+                    ];
+                    pos[v] = mid;
+                    merged_roots.push(v as u32);
+                    let (ru, rv) = (ufind(&mut uf, u as u32), ufind(&mut uf, v as u32));
+                    uf[ru as usize] = rv;
+                    for &ti in v2t[u].iter().chain(v2t[v].iter()) {
+                        let tt = self.tris[ti as usize];
+                        for k in 0..3 {
+                            used_v[tt[k] as usize] = true;
+                        }
+                    }
+                    used_t[da] = true;
+                    used_t[db] = true;
+                    n_collapsed += 1;
+                }
+                if n_collapsed == 0 {
+                    break;
+                }
+                // 合并点投影回零等值面:弦中点在凸缘处必落在材料内/外,
+                // 邻接三角会翘起成针刺(实测修复后出现尖齿)。Newton 投影
+                // 把它拉回零面,消除塌缩自身的几何副作用。
+                for &r in merged_roots.iter() {
+                    let mut q = pos[r as usize];
+                    for _ in 0..3 {
+                        let q_r = [q[0] as Real, q[1] as Real, q[2] as Real];
+                        let d0 = adf.eval(q_r) as f64;
+                        if d0.abs() > max_edge {
+                            break;
+                        }
+                        let mut g = [0.0f64; 3];
+                        for k in 0..3 {
+                            let mut qq = q_r;
+                            qq[k] += hstep;
+                            g[k] = (adf.eval(qq) as f64 - d0) / hstep;
+                        }
+                        let g2 = g[0] * g[0] + g[1] * g[1] + g[2] * g[2];
+                        if g2 < 0.25 {
+                            break;
+                        }
+                        let mut st = [-d0 * g[0] / g2, -d0 * g[1] / g2, -d0 * g[2] / g2];
+                        let sl = (st[0] * st[0] + st[1] * st[1] + st[2] * st[2]).sqrt();
+                        if sl > max_edge {
+                            let f = max_edge / sl;
+                            for k in 0..3 {
+                                st[k] *= f;
+                            }
+                        }
+                        q = [q[0] + st[0], q[1] + st[1], q[2] + st[2]];
+                    }
+                    pos[r as usize] = q;
+                }
+                // 重建:跳过死面;顶点按并查集根合并,未引用顶点压缩掉
+                let root = |x: u32| -> u32 {
+                    let mut r = x;
+                    loop {
+                        let nr = uf[r as usize];
+                        if nr == r {
+                            break;
+                        }
+                        r = nr;
+                    }
+                    r
+                };
+                let mut remap: Vec<u32> = vec![u32::MAX; nv];
+                let mut newv: Vec<[f32; 3]> = Vec::new();
+                let mut new_tris: Vec<[u32; 3]> = Vec::with_capacity(n_t);
+                let mut n_drop = 0usize;
+                for t in self.tris.iter() {
+                    let r = [root(t[0]), root(t[1]), root(t[2])];
+                    if r[0] == r[1] || r[1] == r[2] || r[0] == r[2] {
+                        n_drop += 1;
+                        continue;
+                    }
+                    let mut nt = [0u32; 3];
+                    for k in 0..3 {
+                        if remap[r[k] as usize] == u32::MAX {
+                            remap[r[k] as usize] = newv.len() as u32;
+                            let pr = pos[r[k] as usize];
+                            newv.push([pr[0] as f32, pr[1] as f32, pr[2] as f32]);
+                        }
+                        nt[k] = remap[r[k] as usize];
+                    }
+                    new_tris.push(nt);
+                }
+                self.tris = new_tris;
+                self.verts = newv;
+                total_collapsed += n_collapsed;
+                total_removed += n_drop;
+            }
+            (total_collapsed, total_removed)
         }
 
         /// 丢弃**碎屑分量**:三角数 < `min_tris`,**或**体积 < `min_vol_frac` × 总体积。
