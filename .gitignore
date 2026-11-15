@@ -14,3 +14,8 @@ stls/*
 !stls/Turbo_Impeller.stl
 out_*.stl
 roundtrip.stl
+
+# 生成物不进 git(超大 STL 超 GitHub 100MB 单文件限制)
+stl_out*.stl
+out_*.stl
+roundtrip.stl

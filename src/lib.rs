@@ -2633,94 +2633,98 @@ pub mod nets {
                     })
                     .collect();
                 let edge_angle_cos: f64 = (-25.0f64).to_radians().cos(); // cos(>25°) 上界
-                let is_feature_edge = |a: u32, b: u32| -> bool {
-                    if let Some([t0, t1]) = face_of.get(&(a.min(b), a.max(b))) {
-                        if *t1 != u32::MAX {
-                            let (n0, n1) = (tri_n[*t0 as usize], tri_n[*t1 as usize]);
-                            let d = (n0[0] * n1[0] + n0[1] * n1[1] + n0[2] * n1[2]).clamp(-1.0, 1.0);
-                            return d < edge_angle_cos;
-                        }
-                    }
-                    false
-                };
-                // 特征邻居计数:恰 2 条特征边的顶点 = 链内部点
-                // (遍历去重后的边集合;若遍历三角,共享边会计两次)
-                let mut feat_cnt = vec![0u8; n];
-                let mut feat_adj: Vec<Vec<u32>> = vec![Vec::new(); n];
-                for (key, _slot) in face_of.iter() {
-                    let (a, b) = (key.0, key.1);
-                    if is_feature_edge(a, b) {
-                        feat_cnt[a as usize] += 1;
-                        feat_cnt[b as usize] += 1;
-                        feat_adj[a as usize].push(b);
-                        feat_adj[b as usize].push(a);
+                // PCA 主方向切向收紧:锯齿是沿缘方向的格级波动。缘带顶点的
+                // **特征边(两面夹角大)主要是横向跨缘边**——缘带内部沿缘边的
+                // 两侧是同一面的相邻面片,夹角小,不是特征边——所以不能用
+                // 特征邻居选"沿缘对"(实测:按特征邻居收紧,方向全错,残差
+                // 不动)。改用**全部网格邻居的 PCA 主轴**:缘带顶点沿缘排成
+                // 长链(跨 3-6 格),横向只有短跨——主轴 = 缘方向;把
+                // (邻居质心 − 顶点)只取沿主轴分量收紧 = 抹掉沿缘波动,
+                // 横向(缘宽)不动。位移再减去 ADF 梯度分量(保持离面距离,
+                // 防止投影撤销)。
+                let mut all_adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+                for t in &self.tris {
+                    for k in 0..3 {
+                        let (a, b) = (t[k] as usize, t[(k + 1) % 3] as usize);
+                        all_adj[a].push(b as u32);
+                        all_adj[b].push(a as u32);
                     }
                 }
-                // 对每个特征顶点,在特征邻居中找**最共线的一对**(夹角最接近
-                // 180°)——那是"穿过该顶点的边缘线"的两个方向。方缘/钝缘的
-                // 边缘网格顶点连 4 条特征边(沿缘 2 + 跨缘 2),只向"沿缘对"
-                // 的中点收紧:跨缘邻居不参与,缘宽不被抹掉;锯齿(沿缘的
-                // 格级波动)被弦中点收紧抹平,法向偏差交给投影步拉回。
+                // 顶点邻面法线最大夹角 > 25° ⟹ 锐边顶点(与吸附块同判据)
+                let mut sharp2 = vec![false; n];
+                for (key, slot) in face_of.iter() {
+                    if slot[1] == u32::MAX {
+                        continue;
+                    }
+                    let d = tri_n[slot[0] as usize][0] * tri_n[slot[1] as usize][0]
+                        + tri_n[slot[0] as usize][1] * tri_n[slot[1] as usize][1]
+                        + tri_n[slot[0] as usize][2] * tri_n[slot[1] as usize][2];
+                    if d < edge_angle_cos {
+                        sharp2[key.0 as usize] = true;
+                        sharp2[key.1 as usize] = true;
+                    }
+                }
                 const EDGE_ITERS: usize = 3;
+                let lambda: f64 = 0.6;
                 let mut n_tight = 0u64;
                 let mut sum_move = 0.0f64;
                 for _ in 0..EDGE_ITERS {
                     for i in 0..n {
-                        let ns = &feat_adj[i];
-                        if ns.len() < 2 {
+                        if !sharp2[i] {
                             continue;
                         }
+                        let ns = &all_adj[i];
+                        if ns.len() < 3 {
+                            continue;
+                        }
+                        // 邻居质心与协方差
                         let pi = p[i];
-                        let mut best_cos = 0.0f64;
-                        let mut best_pair = (0usize, 0usize);
-                        for x in 0..ns.len() {
-                            for y in (x + 1)..ns.len() {
-                                let pa = p[ns[x] as usize];
-                                let pc = p[ns[y] as usize];
-                                let d1 = [pa[0] - pi[0], pa[1] - pi[1], pa[2] - pi[2]];
-                                let d2 = [pc[0] - pi[0], pc[1] - pi[1], pc[2] - pi[2]];
-                                let l1 = (d1[0] * d1[0] + d1[1] * d1[1] + d1[2] * d1[2]).sqrt();
-                                let l2 = (d2[0] * d2[0] + d2[1] * d2[1] + d2[2] * d2[2]).sqrt();
-                                if l1 < 1e-12 || l2 < 1e-12 {
-                                    continue;
-                                }
-                                let c =
-                                    (d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2]) / (l1 * l2);
-                                if c < best_cos {
-                                    best_cos = c;
-                                    best_pair = (x, y);
+                        let mut mean = [0.0f64; 3];
+                        for &j in ns {
+                            let q = p[j as usize];
+                            for k in 0..3 {
+                                mean[k] += q[k];
+                            }
+                        }
+                        let inv = 1.0 / ns.len() as f64;
+                        for k in 0..3 {
+                            mean[k] *= inv;
+                        }
+                        let mut cov = [[0.0f64; 3]; 3];
+                        for &j in ns {
+                            let q = p[j as usize];
+                            let d = [q[0] - mean[0], q[1] - mean[1], q[2] - mean[2]];
+                            for a in 0..3 {
+                                for b in 0..3 {
+                                    cov[a][b] += d[a] * d[b];
                                 }
                             }
                         }
-                        // 只在近似共线(夹角 > 120°)时收紧:确信是穿过的边缘线
-                        if best_cos > -0.5 {
-                            continue;
+                        // 幂迭代:协方差最大特征向量 = 缘方向
+                        let mut v = [0.31, 0.42, 0.85];
+                        for _ in 0..10 {
+                            let w = [
+                                cov[0][0] * v[0] + cov[0][1] * v[1] + cov[0][2] * v[2],
+                                cov[1][0] * v[0] + cov[1][1] * v[1] + cov[1][2] * v[2],
+                                cov[2][0] * v[0] + cov[2][1] * v[1] + cov[2][2] * v[2],
+                            ];
+                            let l = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+                            if l < 1e-15 {
+                                break;
+                            }
+                            v = [w[0] / l, w[1] / l, w[2] / l];
                         }
-                        let (a, c) = (
-                            p[ns[best_pair.0] as usize],
-                            p[ns[best_pair.1] as usize],
-                        );
-                        let mid = [
-                            (a[0] + c[0]) * 0.5,
-                            (a[1] + c[1]) * 0.5,
-                            (a[2] + c[2]) * 0.5,
-                        ];
-                        let mv0 = [
-                            0.5 * (mid[0] - p[i][0]),
-                            0.5 * (mid[1] - p[i][1]),
-                            0.5 * (mid[2] - p[i][2]),
-                        ];
-                        // 纯切向:去掉位移沿 ADF 梯度的分量,保持离面距离不变。
-                        // 否则收紧把顶点拉离零面 ~残差量级,随后的 Newton 投影
-                        // 沿(锐边处含强切向分量的)梯度把它拉回,抵消排齐。
-                        let mut mv = mv0;
+                        // 沿主轴的质心偏差 = 沿缘锯齿分量
+                        let d = [mean[0] - pi[0], mean[1] - pi[1], mean[2] - pi[2]];
+                        let dt = d[0] * v[0] + d[1] * v[1] + d[2] * v[2];
+                        let mut mv = [lambda * dt * v[0], lambda * dt * v[1], lambda * dt * v[2]];
+                        // 纯切向:减去沿 ADF 梯度的分量(保持离面距离)
                         {
-                            let qc = p[i];
-                            let d0c = adf.eval(qc) as f64;
+                            let d0c = adf.eval(pi) as f64;
                             let hs = 1e-3 * adf.size;
                             let mut g = [0.0f64; 3];
                             for k in 0..3 {
-                                let mut qq = qc;
+                                let mut qq = pi;
                                 qq[k] += hs;
                                 g[k] = (adf.eval(qq) as f64 - d0c) / hs;
                             }
@@ -2741,7 +2745,7 @@ pub mod nets {
                 }
                 if n_tight > 0 {
                     eprintln!(
-                        "[edge-smooth] 切向收紧 {n_tight} 点/3 迭代,均 {:.4} mm/次",
+                        "[edge-smooth] PCA 切向收紧 {n_tight} 点/3 迭代,均 {:.4} mm/次",
                         sum_move / n_tight as f64
                     );
                 }
@@ -2874,6 +2878,168 @@ pub mod nets {
                     }
                 }
                 eprintln!("[snap] 吸附 {n_snap} 锐边顶点到原始特征(lim={lim})");
+
+                // ── 原始缘点云吸附:锯齿是边缘线的**形状误差**(顶点相对邻居
+                // 光滑、相对原始缘线偏 0.1-0.3mm),任何"相对邻居"的滤波都
+                // 无效(实测:切向收紧力度 ×2.7、PCA 主轴收紧,残差均不动),
+                // 必须引入**外部参照**。原始叶轮边缘是光滑圆缘——原始网格里
+                // 它表现为二面角 > 10° 的顶点带(缘点云)。输出锐边顶点吸附到
+                // 缘点云的最近点:切向对齐到原始缘线(锯齿消除),横向由
+                // "最近点"自然保持(缘带多排点,不压扁)。70% 部分吸附避免
+                // 多顶点吸到同一点后完全重合。
+                {
+                    // 1) 原始缘带顶点:邻面法线夹角 > 10°(光滑缘的二面角峰)
+                    // 原始网格顶点焊接(量化 key → id)
+                    let qo = |x: Real| (x * 1e4).round() as i64;
+                    let mut ovmap: std::collections::HashMap<[i64; 3], u32> =
+                        std::collections::HashMap::new();
+                    let mut ovs: Vec<[f64; 3]> = Vec::new();
+                    let mut otv: Vec<[u32; 3]> = Vec::with_capacity(m.tris.len());
+                    for t in m.tris.iter() {
+                        let mut ids = [0u32; 3];
+                        for (k, v) in t.iter().enumerate() {
+                            let key = [qo(v[0]), qo(v[1]), qo(v[2])];
+                            let id = *ovmap.entry(key).or_insert_with(|| {
+                                ovs.push([v[0] as f64, v[1] as f64, v[2] as f64]);
+                                (ovs.len() - 1) as u32
+                            });
+                            ids[k] = id;
+                        }
+                        otv.push(ids);
+                    }
+                    let mut ot_n: Vec<[f64; 3]> = Vec::with_capacity(m.tris.len());
+                    for t in m.tris.iter() {
+                        let (a, b, c) = (t[0], t[1], t[2]);
+                        let ab = [
+                            b[0] as f64 - a[0] as f64,
+                            b[1] as f64 - a[1] as f64,
+                            b[2] as f64 - a[2] as f64,
+                        ];
+                        let ac = [
+                            c[0] as f64 - a[0] as f64,
+                            c[1] as f64 - a[1] as f64,
+                            c[2] as f64 - a[2] as f64,
+                        ];
+                        let cr = [
+                            ab[1] * ac[2] - ab[2] * ac[1],
+                            ab[2] * ac[0] - ab[0] * ac[2],
+                            ab[0] * ac[1] - ab[1] * ac[0],
+                        ];
+                        let l = (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]).sqrt();
+                        ot_n.push(if l > 1e-12 {
+                            [cr[0] / l, cr[1] / l, cr[2] / l]
+                        } else {
+                            [0.0; 3]
+                        });
+                    }
+                    let mut oeid: std::collections::HashMap<(u32, u32), [u32; 2]> =
+                        std::collections::HashMap::with_capacity(m.tris.len() * 3);
+                    for (ti, t) in otv.iter().enumerate() {
+                        for k in 0..3 {
+                            let (a, b) = (t[k], t[(k + 1) % 3]);
+                            let key = (a.min(b), a.max(b));
+                            match oeid.get_mut(&key) {
+                                Some(slot) => slot[1] = ti as u32,
+                                None => {
+                                    oeid.insert(key, [ti as u32, u32::MAX]);
+                                }
+                            }
+                        }
+                    }
+                    let cos10 = (-10.0f64).to_radians().cos();
+                    // 缘边 = 线段集合(连续吸附目标,离散点吸附会产生折痕)
+                    let mut rim_segs: Vec<[[f64; 3]; 2]> = Vec::new();
+                    for (key, slot) in oeid.iter() {
+                        if slot[1] == u32::MAX {
+                            continue;
+                        }
+                        let d = ot_n[slot[0] as usize][0] * ot_n[slot[1] as usize][0]
+                            + ot_n[slot[0] as usize][1] * ot_n[slot[1] as usize][1]
+                            + ot_n[slot[0] as usize][2] * ot_n[slot[1] as usize][2];
+                        if d < cos10 {
+                            rim_segs.push([ovs[key.0 as usize], ovs[key.1 as usize]]);
+                        }
+                    }
+                    // 2) 空间哈希(格 0.4mm,按线段两端所属桶+中点桶)
+                    let cell = 0.4f64;
+                    let key_of = |p: [f64; 3]| -> (i64, i64, i64) {
+                        (
+                            (p[0] / cell).floor() as i64,
+                            (p[1] / cell).floor() as i64,
+                            (p[2] / cell).floor() as i64,
+                        )
+                    };
+                    let mut grid: std::collections::HashMap<(i64, i64, i64), Vec<u32>> =
+                        std::collections::HashMap::with_capacity(rim_segs.len());
+                    for (si, s) in rim_segs.iter().enumerate() {
+                        let mut keys = std::collections::HashSet::new();
+                        keys.insert(key_of(s[0]));
+                        keys.insert(key_of(s[1]));
+                        keys.insert(key_of([
+                            (s[0][0] + s[1][0]) * 0.5,
+                            (s[0][1] + s[1][1]) * 0.5,
+                            (s[0][2] + s[1][2]) * 0.5,
+                        ]));
+                        for k in keys {
+                            grid.entry(k).or_default().push(si as u32);
+                        }
+                    }
+                    // 点到线段最近点
+                    let seg_closest = |q: [f64; 3], s: [[f64; 3]; 2]| -> [f64; 3] {
+                        let ab = [s[1][0] - s[0][0], s[1][1] - s[0][1], s[1][2] - s[0][2]];
+                        let ap = [q[0] - s[0][0], q[1] - s[0][1], q[2] - s[0][2]];
+                        let ab2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                        let tt = if ab2 > 1e-18 {
+                            ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / ab2).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        [
+                            s[0][0] + ab[0] * tt,
+                            s[0][1] + ab[1] * tt,
+                            s[0][2] + ab[2] * tt,
+                        ]
+                    };
+                    // 3) 输出锐边顶点 → 最近缘线段最近点(70% 吸附)
+                    let mut n_snap2 = 0u64;
+                    for i in 0..n {
+                        if !sharp[i] {
+                            continue;
+                        }
+                        let q = p[i];
+                        let (ki, kj, kk) = key_of(q);
+                        let (mut best_d2, mut best_pt) = (f64::INFINITY, [0.0f64; 3]);
+                        for da in -1i64..=1 {
+                            for db in -1i64..=1 {
+                                for dc in -1i64..=1 {
+                                    if let Some(list) = grid.get(&(ki + da, kj + db, kk + dc)) {
+                                        for &si in list {
+                                            let cpt = seg_closest(q, rim_segs[si as usize]);
+                                            let d2 = (cpt[0] - q[0]).powi(2)
+                                                + (cpt[1] - q[1]).powi(2)
+                                                + (cpt[2] - q[2]).powi(2);
+                                            if d2 < best_d2 {
+                                                best_d2 = d2;
+                                                best_pt = cpt;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if best_d2.is_finite() && best_d2 <= lim * lim {
+                            for k in 0..3 {
+                                p[i][k] += 0.7 * (best_pt[k] - q[k]);
+                            }
+                            n_snap2 += 1;
+                        }
+                    }
+                    eprintln!(
+                        "[snap] 缘线段 {} 条,吸附 {} 锐边顶点(lim={lim})",
+                        rim_segs.len(),
+                        n_snap2
+                    );
+                }
             }
             let (mut sum, mut mx) = (0.0f64, 0.0f64);
             for i in 0..n {
