@@ -405,6 +405,30 @@ impl BakeGrid {
         self.data[self.idx(g[0], g[1], g[2])] as Real
     }
 
+    /// 三线性采样(域外先钳位到边界格);诊断用。
+    #[inline]
+    pub fn sample_trilinear(&self, p: [Real; 3]) -> f32 {
+        let nmax = self.n - 1;
+        let mut g = [0usize; 3];
+        let mut f = [0.0f64; 3];
+        for a in 0..3 {
+            let tc = ((p[a] - self.min[a]) / self.h).max(0.0).min(nmax as Real);
+            let i = (tc as usize).min(nmax.saturating_sub(1));
+            g[a] = i;
+            f[a] = (tc - i as Real).clamp(0.0, 1.0);
+        }
+        let (i1, j1, k1) = ((g[0] + 1).min(nmax), (g[1] + 1).min(nmax), (g[2] + 1).min(nmax));
+        let d = &self.data;
+        let v = |i: usize, j: usize, k: usize| d[self.idx(i, j, k)] as Real;
+        let (u, vv, w) = (f[0], f[1], f[2]);
+        let c00 = v(g[0], g[1], g[2]) * (1.0 - u) + v(i1, g[1], g[2]) * u;
+        let c10 = v(g[0], j1, g[2]) * (1.0 - u) + v(i1, j1, g[2]) * u;
+        let c01 = v(g[0], g[1], k1) * (1.0 - u) + v(i1, g[1], k1) * u;
+        let c11 = v(g[0], j1, k1) * (1.0 - u) + v(i1, j1, k1) * u;
+        let c0 = c00 * (1.0 - vv) + c10 * vv;
+        let c1 = c01 * (1.0 - vv) + c11 * vv;
+        (c0 * (1.0 - w) + c1 * w) as f32
+    }
 }
 
 /// 1D 平方距离变换(Felzenszwalb & Huttenlocher 2012 思想,自实现):
@@ -1708,12 +1732,7 @@ impl Adf {
     /// 自适应求值:下降到包含 p 的叶,角点三线性插值。
     /// 已知限制:跨分辨率边界处插值基不一致,存在 T-junction 误差(spike 要测的就是它)。
     pub fn eval(&self, p: [Real; 3]) -> f32 {
-        let hi = self.min[0] + self.size;
-        let q = [
-            clamp(p[0], self.min[0], hi - 1e-9),
-            clamp(p[1], self.min[1], hi - 1e-9),
-            clamp(p[2], self.min[2], hi - 1e-9),
-        ];
+        let q = self.clamp_to_domain(p);
         let mut o = self.min;
         let mut s = self.size;
         let mut idx = self.root;
@@ -1745,12 +1764,7 @@ impl Adf {
 
     /// p 所在叶的深度(诊断用)。
     pub fn depth_at(&self, p: [Real; 3]) -> u8 {
-        let hi = self.min[0] + self.size;
-        let q = [
-            clamp(p[0], self.min[0], hi - 1e-9),
-            clamp(p[1], self.min[1], hi - 1e-9),
-            clamp(p[2], self.min[2], hi - 1e-9),
-        ];
+        let q = self.clamp_to_domain(p);
         let mut o = self.min;
         let mut s = self.size;
         let mut idx = self.root;
@@ -1777,12 +1791,7 @@ impl Adf {
     /// 诊断:转储 p 所在叶的 8 个角点(位置/值)。
     pub fn dump_leaf(&self, p: [Real; 3]) {
         // 先下降到叶,记录 origin/size
-        let hi = self.min[0] + self.size;
-        let q = [
-            clamp(p[0], self.min[0], hi - 1e-9),
-            clamp(p[1], self.min[1], hi - 1e-9),
-            clamp(p[2], self.min[2], hi - 1e-9),
-        ];
+        let q = self.clamp_to_domain(p);
         let mut o = self.min;
         let mut s = self.size;
         let mut idx = self.root;
@@ -1957,6 +1966,19 @@ impl Adf {
         st.corrected = corrected;
         st.t_write = t_write.elapsed();
         st
+    }
+
+    /// 把 p 钳入域内。**逐轴**上界 = `min[k] + size`:域是从 `min` 起、边长 `size`
+    /// 的立方体,而 `min` 各轴不同(域是把零件 bbox 各轴按最大边长对齐出来的),
+    /// 用 axis-0 的上界会把另一轴的高坐标误钳到边界 —— `eval` 因此落到错误的叶,
+    /// 远场误差达数十毫米(P6 的真实根因,2026-11-15 定位)。
+    #[inline]
+    fn clamp_to_domain(&self, p: [Real; 3]) -> [Real; 3] {
+        let mut q = [0.0; 3];
+        for k in 0..3 {
+            q[k] = clamp(p[k], self.min[k], self.min[k] + self.size - 1e-9);
+        }
+        q
     }
 
     fn collect_interface(
@@ -3742,6 +3764,30 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 50, "有效样本过少:{checked}");
+    }
+
+    /// 域**逐轴**钳位的回归测试:`min` 各轴不同时,`min[0]+size` 绝不能用作
+    /// 其他轴的上界。旧实现如此,导致 `eval` 把高坐标钳到边界、落到错误的叶里
+    /// (叶轮远场 mean 8.8mm / max 82mm 的真实根因)。
+    #[test]
+    fn eval_clamps_per_axis_not_axis0() {
+        // 域 y∈[-1,3],而 min[0]+size = 2.0 —— 旧代码会把 y=2.9 钳成 2.0
+        let a = Adf::build(
+            Stock::Sphere { c: [0.0, 2.6, 0.0], r: 0.5 },
+            [-2.0, -1.0, -2.0],
+            4.0,
+            0.005,
+            0.2,
+            6,
+        );
+        let p = [0.0, 2.9, 0.0];
+        let got = a.eval(p) as Real;
+        let truth = a.true_sd(p);
+        assert!(truth < 0.0, "该点在球内,真值应为负(实际 {truth})");
+        assert!(
+            got < 0.0 && (got - truth).abs() < 0.15,
+            "y=2.9 被误钳(旧实现钳到 y=2.0 → 正值):got={got} truth={truth}"
+        );
     }
 
     #[test]

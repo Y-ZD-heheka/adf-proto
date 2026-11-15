@@ -75,6 +75,9 @@ fn main() {
     let mut max_e = 0.0f64;
     let mut sum_e = 0.0f64;
     let mut cnt = 0u64;
+    // 拆分:符号相反(拓扑/定号问题) vs 符号一致但幅值有偏差(插值/分辨率问题)
+    let (mut n_sign, mut max_sign, mut sum_sign) = (0u64, 0.0f64, 0.0f64);
+    let (mut n_mag, mut max_mag, mut sum_mag) = (0u64, 0.0f64, 0.0f64);
     for _ in 0..2000 {
         let p = [
             min[0] + rng.f01() * size,
@@ -82,14 +85,32 @@ fn main() {
             min[2] + rng.f01() * size,
         ];
         let direct = adf.field.base.sd(p) as Real;
-        let e = (adf.eval(p) as Real - direct).abs();
+        let got = adf.eval(p) as Real;
+        let e = (got - direct).abs();
         max_e = max_e.max(e);
         sum_e += e;
         cnt += 1;
+        if (got < 0.0) != (direct < 0.0) {
+            n_sign += 1;
+            max_sign = max_sign.max(e);
+            sum_sign += e;
+        } else {
+            n_mag += 1;
+            max_mag = max_mag.max(e);
+            sum_mag += e;
+        }
     }
     println!(
         "[error] 随机 {cnt} 点:ADF vs 网格直查 max={max_e:.4} mean={:.4} mm(粗格区允许偏差)",
         sum_e / cnt as Real
+    );
+    println!(
+        "[error.split] 符号相反 {:>4} 点({:.1}%) max={max_sign:.3} mean={:.3} | 符号一致 {:>4} 点 max={max_mag:.3} mean={:.3}",
+        n_sign,
+        n_sign as f64 / cnt as f64 * 100.0,
+        sum_sign / n_sign.max(1) as Real,
+        n_mag,
+        sum_mag / n_mag.max(1) as Real
     );
 
     // ── 5) 切削:两条胶囊穿过模型(沿 X / 沿 Z) ──
