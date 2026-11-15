@@ -12,3 +12,5 @@ vtune_*/
 stls/*
 !stls/桌腿固定器.stl
 !stls/Turbo_Impeller.stl
+out_*.stl
+roundtrip.stl

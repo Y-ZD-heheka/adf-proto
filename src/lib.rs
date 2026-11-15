@@ -2471,6 +2471,93 @@ pub mod nets {
             flipped
         }
 
+        /// 丢弃**碎屑分量**:三角数 < `min_tris`,**或**体积 < `min_vol_frac` × 总体积。
+        /// 这类分量是场里孤立的小符号岛,在查看器里表现为浮在表面的斑点;切片软件
+        /// 通常也直接忽略。用"相对体积"而不只看三角数,是因为三角数与网格密度挂钩
+        /// (本工程 2×h_min 提取时,1mm³ 只有几十个三角)。
+        /// 返回(丢弃的分量数, 丢弃的三角数)。
+        pub fn drop_small_components(&mut self, min_tris: usize, min_vol_frac: f64) -> (usize, usize) {
+            let n = self.tris.len();
+            let mut par: Vec<u32> = (0..n as u32).collect();
+            fn find(p: &mut [u32], mut x: u32) -> u32 {
+                while p[x as usize] != x {
+                    p[x as usize] = p[p[x as usize] as usize];
+                    x = p[x as usize];
+                }
+                x
+            }
+            let mut edge: std::collections::HashMap<u64, u32, FxBuild> =
+                std::collections::HashMap::with_capacity_and_hasher(n * 3, FxBuild);
+            for (ti, t) in self.tris.iter().enumerate() {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let key = if a < b {
+                        ((a as u64) << 32) | b as u64
+                    } else {
+                        ((b as u64) << 32) | a as u64
+                    };
+                    if let Some(&other) = edge.get(&key) {
+                        let x = find(&mut par, ti as u32);
+                        let y = find(&mut par, other);
+                        if x != y {
+                            par[y as usize] = x;
+                        }
+                    } else {
+                        edge.insert(key, ti as u32);
+                    }
+                }
+            }
+            let mut count: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+            let mut vols: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+            let mut total_vol = 0.0f64;
+            for ti in 0..n {
+                let r = find(&mut par, ti as u32);
+                *count.entry(r).or_insert(0) += 1;
+                let t = self.tris[ti];
+                let (a, b, c) = (
+                    self.verts[t[0] as usize],
+                    self.verts[t[1] as usize],
+                    self.verts[t[2] as usize],
+                );
+                let (ax, ay, az) = (a[0] as f64, a[1] as f64, a[2] as f64);
+                let (bx, by, bz) = (b[0] as f64, b[1] as f64, b[2] as f64);
+                let (cx, cy, cz) = (c[0] as f64, c[1] as f64, c[2] as f64);
+                let v = (ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx)
+                    + az * (bx * cy - by * cx))
+                    / 6.0;
+                *vols.entry(r).or_insert(0.0) += v;
+                total_vol += v;
+            }
+            let total_vol = total_vol.abs();
+            let mut drop = vec![false; n];
+            let (mut nd, mut nt) = (0usize, 0usize);
+            for ti in 0..n {
+                let r = find(&mut par, ti as u32);
+                let small = count[&r] < min_tris
+                    || vols[&r].abs() < min_vol_frac * total_vol;
+                if small {
+                    drop[ti] = true;
+                    nt += 1;
+                }
+            }
+            if nt > 0 {
+                let mut i = 0usize;
+                self.tris.retain(|_| {
+                    let keep = !drop[i];
+                    i += 1;
+                    keep
+                });
+                // 统计丢了几个分量
+                let mut dropped_roots = std::collections::HashSet::new();
+                for ti in 0..n {
+                    if drop[ti] {
+                        dropped_roots.insert(find(&mut par, ti as u32));
+                    }
+                }
+                nd = dropped_roots.len();
+            }
+            (nd, nt)
+        }
+
         /// 拓扑体检:返回(开放边数, 非流形边数, 连通分量数)。
         /// **开放边** = 只被 1 个三角使用的边,即"洞"的边界 —— STL 打印/网格修复
         /// 关注的正是这个数:闭合实体应为 0。非流形边 >2 个三角同边,同样不可打印。
@@ -2490,7 +2577,9 @@ pub mod nets {
                     nonman += 1;
                 }
             }
-            // 并查集数连通分量(顶点共享即连通)
+            // 并查集数连通分量(顶点共享即连通)。只统计**被三角引用**的顶点 ——
+            // 清理碎屑后残留的孤立顶点不是分量(否则 928k 顶点里未用到的每个都算一个,
+            // 实测把 10 个分量报成 541 个)。
             let n = self.verts.len();
             let mut par: Vec<u32> = (0..n as u32).collect();
             fn find(p: &mut [u32], mut x: u32) -> u32 {
@@ -2510,9 +2599,10 @@ pub mod nets {
                 }
             }
             let mut roots = std::collections::HashSet::new();
-            for v in 0..n as u32 {
-                let r = find(&mut par, v);
-                roots.insert(r);
+            for t in &self.tris {
+                for &v in t.iter() {
+                    roots.insert(find(&mut par, v));
+                }
             }
             (open, nonman, roots.len() as u32)
         }
