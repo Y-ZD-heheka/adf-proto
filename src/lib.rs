@@ -711,13 +711,23 @@ fn bake_field(base: &BaseField, min: [Real; 3], size: Real) -> (BakeGrid, CandGr
     // 站点 = 种子带格点(phi 有限);三轴 1D 下抛物线包络合成,O(N) 且精确
     // (弃用扫掠:一阶 Godunov 对角各向异性给点源/凸面源远场带来 ~+30% 系统误差)。
     // 误差界:站点带贴表面 ~1 格 → d − h ≲ EDT ≲ d + 1.8h(双侧,近测试可保守)。
-    // 符号 = 最近站的 phi 符号(带是闭合壳,内外最近站符号正确;
-    // 封闭腔无负站点 → 退化正距离,同前述限制)。
+    // 符号:带内取**精确** phi 符号;带外由洪泛界定(见 flood_outside_sign)。
+    // 旧做法"取最近站的 phi 符号"有两处结构性错误:
+    //   ① 薄壁件:壁厚 < 站点带间距时,壁内侧的最近站落在壁的另一侧 → 符号取反
+    //      (叶轮实测 [error.split] 符号相反 31/2000,max 61.8mm);
+    //   ② 封闭腔:腔内没有任何负站点 → 整个腔退化成正距离。
+    // 洪泛只依赖拓扑(带是闭合隔板),与壁厚、站距都无关,并顺带补上腔体负号。
+    let sign = flood_outside_sign(&phi, n);
     let mut d2 = vec![0.0f64; npts];
     let mut arg = vec![0u32; npts];
+    let inv_h = 1.0 / h;
     for c in 0..npts {
         if phi[c].is_finite() {
-            d2[c] = 0.0;
+            // 种子保留**亚格距离**(phi/h)²:EDT 于是求 min(dist² + f),
+            // 等价于"到半径为 |phi| 的球面"的平方距离 —— 带内的亚格精度不再被丢掉。
+            // 旧写法置 0,等于只量"到最近种子格点"的距离,系统高估(≤1.5h)。
+            let t = phi[c] as f64 * inv_h;
+            d2[c] = t * t;
             arg[c] = c as u32;
         } else {
             d2[c] = f64::INFINITY;
@@ -727,16 +737,126 @@ fn bake_field(base: &BaseField, min: [Real; 3], size: Real) -> (BakeGrid, CandGr
     edt_axis(&mut d2, &mut arg, n, 0);
     edt_axis(&mut d2, &mut arg, n, 1);
     edt_axis(&mut d2, &mut arg, n, 2);
+    let mut n_flip = 0u64;
     for c in 0..npts {
-        if d2[c].is_finite() && arg[c] != u32::MAX {
-            let sgn = if phi[arg[c] as usize] < 0.0 { -1.0 } else { 1.0 };
-            // EDT 在格单位下工作 → × h 转毫米
-            data[c] = sgn * (d2[c].max(0.0).sqrt() * h as f64) as f32;
+        // EDT 在格单位下工作 → × h 转毫米
+        let mag = if d2[c].is_finite() {
+            (d2[c].max(0.0).sqrt() * h as f64) as f32
         } else {
-            data[c] = 0.0;
+            0.0
+        };
+        data[c] = sign[c] as f32 * mag;
+        if d2[c].is_finite() && arg[c] != u32::MAX {
+            let old = if phi[arg[c] as usize] < 0.0 { -1.0f32 } else { 1.0 };
+            if old != sign[c] as f32 {
+                n_flip += 1;
+            }
         }
     }
+    eprintln!("[bake.sign] 洪泛定号 vs 最近站定号:不同 {n_flip} / {npts} 格");
     (BakeGrid { min, n, h, data }, cg)
+}
+
+/// 带外符号:①域边界可达的非带区 = 外部(+1);②其余非带区按**连通分量**处理,
+/// 每个分量由"相邻带内节点的精确 phi 符号"投票定号 —— 这区分了两类不可达区:
+/// 材料内部(相邻带点为负)与**封闭空腔**(相邻带点为正,空腔是空气)。
+/// ③带内返回 0,由调用方用精确 phi 符号覆盖;整体 +1/−1。
+///
+/// 正确性前提:①域比零件 bbox 大出一圈(调用方保证 2mm 余量),故"零件外"
+/// 必与域边界连通;②带(|phi| ≤ 1.5h)构成闭合隔板,洪泛不穿墙。
+/// 若带上有洞(种子缺失)会漏填成"外部",表现为远场符号错——由 [error.split] 守门。
+fn flood_outside_sign(phi: &[f32], n: usize) -> Vec<i8> {
+    let mut sign = vec![0i8; phi.len()];
+    let mut seen = vec![false; phi.len()];
+    let plane = n * n;
+    // ── ① 从域边界洪泛:域外的空气必然与边界连通 ──
+    let mut queue: Vec<u32> = Vec::new();
+    for k in 0..n {
+        for j in 0..n {
+            for i in 0..n {
+                if !(i == 0 || j == 0 || k == 0 || i + 1 == n || j + 1 == n || k + 1 == n) {
+                    continue;
+                }
+                let c = (k * n + j) * n + i;
+                if phi[c].is_finite() || seen[c] {
+                    continue;
+                }
+                seen[c] = true;
+                sign[c] = 1;
+                queue.push(c as u32);
+            }
+        }
+    }
+    // 6 邻(面连通:斜向缺口不允许泄漏,薄壁的带因此仍是隔板)
+    let nb = |c: usize| -> [usize; 6] {
+        let i = c % n;
+        let j = (c / n) % n;
+        let k = c / plane;
+        [
+            if i > 0 { c - 1 } else { usize::MAX },
+            if i + 1 < n { c + 1 } else { usize::MAX },
+            if j > 0 { c - n } else { usize::MAX },
+            if j + 1 < n { c + n } else { usize::MAX },
+            if k > 0 { c - plane } else { usize::MAX },
+            if k + 1 < n { c + plane } else { usize::MAX },
+        ]
+    };
+    let mut head = 0usize;
+    while head < queue.len() {
+        let c = queue[head] as usize;
+        head += 1;
+        for cc in nb(c) {
+            if cc != usize::MAX && !seen[cc] && !phi[cc].is_finite() {
+                seen[cc] = true;
+                sign[cc] = 1;
+                queue.push(cc as u32);
+            }
+        }
+    }
+    // ── ② 剩余非带区:逐连通分量投票(材料内部 / 封闭空腔)──
+    let mut comp: Vec<u32> = Vec::new();
+    for s in 0..phi.len() {
+        if seen[s] || phi[s].is_finite() {
+            continue;
+        }
+        comp.clear();
+        comp.push(s as u32);
+        seen[s] = true;
+        let (mut pos, mut neg) = (0u32, 0u32);
+        let mut head = 0usize;
+        while head < comp.len() {
+            let c = comp[head] as usize;
+            head += 1;
+            for cc in nb(c) {
+                if cc == usize::MAX {
+                    continue;
+                }
+                if phi[cc].is_finite() {
+                    // 带内节点是精确的:它的符号就是本分量该取的方向
+                    if phi[cc] < 0.0 {
+                        neg += 1;
+                    } else {
+                        pos += 1;
+                    }
+                } else if !seen[cc] {
+                    seen[cc] = true;
+                    comp.push(cc as u32);
+                }
+            }
+        }
+        // 平票或无边可依时按外部处理(空网格等退化情形保持旧行为)
+        let sg: i8 = if neg > pos { -1 } else { 1 };
+        for &c in &comp {
+            sign[c as usize] = sg;
+        }
+    }
+    // ── ③ 带内:精确 phi 符号 ──
+    for c in 0..phi.len() {
+        if phi[c].is_finite() {
+            sign[c] = if phi[c] < 0.0 { -1 } else { 1 };
+        }
+    }
+    sign
 }
 
 // ─────────────────────────── ADF 树 ───────────────────────────
@@ -3527,6 +3647,47 @@ mod tests {
         eprintln!("[dbg] 切削后校验通过");
     }
 
+
+    /// 带外定号必须**区分材料内部与封闭空腔**:前者不可达且邻带为负,后者不可达
+    /// 但邻带为正。合成:外层球 r=13 是"实体/空气"界面(内负外正),内层球 r=5
+    /// 是封闭空腔(内正外负)。期望:r>14.5 正、6.5<r<11.5 负、r<3.5 正。
+    /// 只按"不可达即内部"实现时,空腔会被判成材料 —— 这条测试正是那个回归点。
+    #[test]
+    fn flood_sign_distinguishes_cavity_from_material() {
+        const N: usize = 41;
+        const R1: f32 = 13.0;
+        const R2: f32 = 5.0;
+        let c0 = (N / 2) as f32;
+        let mut phi = vec![f32::INFINITY; N * N * N];
+        for k in 0..N {
+            for j in 0..N {
+                for i in 0..N {
+                    let r = (((i as f32 - c0).powi(2)
+                        + (j as f32 - c0).powi(2)
+                        + (k as f32 - c0).powi(2)) as f32)
+                        .sqrt();
+                    let v = if (r - R1).abs() <= 1.5 {
+                        Some(r - R1) // 实体外表面:外正内负
+                    } else if (r - R2).abs() <= 1.5 {
+                        Some(R2 - r) // 封闭空腔:内正外负
+                    } else {
+                        None
+                    };
+                    if let Some(v) = v {
+                        phi[(k * N + j) * N + i] = v;
+                    }
+                }
+            }
+        }
+        let sign = flood_outside_sign(&phi, N);
+        let at = |x: usize, y: usize, z: usize| sign[(z * N + y) * N + x];
+        assert_eq!(at(0, 0, 0), 1, "域边界必须是外部");
+        assert_eq!(at(N / 2, N / 2, N / 2), 1, "封闭空腔内部应为空腔(+1)");
+        assert_eq!(at(N / 2 + 9, N / 2, N / 2), -1, "实体层(r=9)应为材料(-1)");
+        // 带内:必须沿用精确 phi 符号
+        assert_eq!(at(N / 2 + 13, N / 2, N / 2), 1, "外表面带外侧应为正");
+        assert_eq!(at(N / 2 + 12, N / 2, N / 2), -1, "外表面带内侧应为负");
+    }
 
     /// 轴对齐平面:EDT 必须**精确**复现(种子为 v=0 的整层格点,不存在离散化鼓包)。
     /// 这是对三轴合成的硬校验:任何一轴的下抛物线包络写错都会破坏它。
