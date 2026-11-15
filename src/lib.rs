@@ -2988,63 +2988,78 @@ pub mod meshfield {
             // 播种:网格种子(粗距 + 2.5h_c 上界)直接作堆剪枝初值。
             // (旧"贪心下降"实测 1.24ms/调用 = 80% 耗时,且与网格种子功能重复,已删;
             //  网格 EDT 界 d−h ≲ grid ≲ d+1.8h ⇒ seed = grid+2.5h ≥ d,上界成立)
-            let mut heap = std::collections::BinaryHeap::new();
-            // 非负 f64 的 to_bits 保持全序 → 直接作为堆键
-            heap.push(std::cmp::Reverse((0f64.to_bits(), self.root)));
-            while let Some(std::cmp::Reverse((bits, ni))) = heap.pop() {
-                let d2_node = f64::from_bits(bits);
+            // 有界栈 **DFS + 剪枝**(替代 best-first 堆)。
+            // 动机(VTune):每次查询新建 BinaryHeap 的分配/扩容/释放占构建 CPU ~22%,
+            // pop 的 sift 另占 ~34%。种子已紧(粗距 + 2.5h_c 上界),`d2 >= best` 剪枝
+            // 与 best-first 排除的是同一批子树,故**遍历结果相同**;DFS 前沿只有 O(树深),
+            // 固定数组即可,免分配、免 sift。近子后入栈 ⟹ 近子先展开(先收紧 best)。
+            const DFS_CAP: usize = 256; // ≥ 2× 最大树深
+            let mut stack = [(0.0f64, 0u32); DFS_CAP];
+            let mut sp = 1usize;
+            stack[0] = (0.0, self.root);
+            while sp > 0 {
+                sp -= 1;
+                let (d2_node, ni) = stack[sp];
                 if d2_node >= best {
-                    break; // 堆顶(全局最小)≥ best → 不可能有更近
+                    continue; // 该子树不可能有更近点
                 }
-                let n = &self.bvh[ni as usize];
-                if n.cnt > 0 {
-                    for &t in &self.order[n.start as usize..(n.start + n.cnt) as usize] {
-                        let tri = &self.tris[t as usize];
-                        // 三角形自身 AABB 早退(预计算,免每次 18 次 min/max)
-                        let (tmn, tmx) = &self.tri_aabb[t as usize];
-                        let mut dd2 = 0.0;
-                        for k in 0..3 {
-                            let dv = if p[k] < tmn[k] {
-                                tmn[k] - p[k]
-                            } else if p[k] > tmx[k] {
-                                p[k] - tmx[k]
-                            } else {
-                                0.0
-                            };
-                            dd2 += dv * dv;
+                    let n = &self.bvh[ni as usize];
+                    if n.cnt > 0 {
+                        for &t in &self.order[n.start as usize..(n.start + n.cnt) as usize] {
+                            let tri = &self.tris[t as usize];
+                            // 三角形自身 AABB 早退(预计算,免每次 18 次 min/max)
+                            let (tmn, tmx) = &self.tri_aabb[t as usize];
+                            let mut dd2 = 0.0;
+                            for k in 0..3 {
+                                let dv = if p[k] < tmn[k] {
+                                    tmn[k] - p[k]
+                                } else if p[k] > tmx[k] {
+                                    p[k] - tmx[k]
+                                } else {
+                                    0.0
+                                };
+                                dd2 += dv * dv;
+                            }
+                            if dd2 >= best {
+                                continue;
+                            }
+                            let (cp, feat) = closest_point_feature(p, tri);
+                            let dd = dot3(sub3(cp, p), sub3(cp, p));
+                            if dd < best {
+                                best = dd;
+                                best_t = t;
+                                best_feat = feat;
+                                best_cp = cp;
+                            }
                         }
-                        if dd2 >= best {
-                            continue;
+                    } else {
+                        let mut cs = [(0.0f64, 0u32); 2];
+                        for (idx, c) in [n.left, n.right].iter().enumerate() {
+                            let cn = &self.bvh[*c as usize];
+                            let mut d2 = 0.0;
+                            for k in 0..3 {
+                                let dv = if p[k] < cn.mn[k] {
+                                    cn.mn[k] - p[k]
+                                } else if p[k] > cn.mx[k] {
+                                    p[k] - cn.mx[k]
+                                } else {
+                                    0.0
+                                };
+                                d2 += dv * dv;
+                            }
+                            cs[idx] = (d2, *c);
                         }
-                        let (cp, feat) = closest_point_feature(p, tri);
-                        let dd = dot3(sub3(cp, p), sub3(cp, p));
-                        if dd < best {
-                            best = dd;
-                            best_t = t;
-                            best_feat = feat;
-                            best_cp = cp;
+                        // 远者先入、近者后入 → 近者先弹出
+                        let order = if cs[0].0 <= cs[1].0 { [1usize, 0] } else { [0, 1] };
+                        for idx in order {
+                            let (d2, c) = cs[idx];
+                            if d2 < best && sp < DFS_CAP {
+                                stack[sp] = (d2, c);
+                                sp += 1;
+                            }
                         }
                     }
-                } else {
-                    for c in [n.left, n.right] {
-                        let cn = &self.bvh[c as usize];
-                        let mut d2 = 0.0;
-                        for k in 0..3 {
-                            let dv = if p[k] < cn.mn[k] {
-                                cn.mn[k] - p[k]
-                            } else if p[k] > cn.mx[k] {
-                                p[k] - cn.mx[k]
-                            } else {
-                                0.0
-                            };
-                            d2 += dv * dv;
-                        }
-                        if d2 < best {
-                            heap.push(std::cmp::Reverse((f64::to_bits(d2), c)));
-                        }
-                    }
                 }
-            }
             (best.sqrt(), best_t, best_feat, best_cp)
         }
 
