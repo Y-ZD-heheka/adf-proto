@@ -2809,10 +2809,22 @@ pub mod nets {
         dim: usize,
         vals: &[f32],
         cell_vert: &[u32],
+        cell_label: &[u8],
         verts: &[[f32; 3]],
         out: &mut Vec<[u32; 3]>,
     ) {
-        let cv = |i: usize, j: usize, k: usize| -> u32 { cell_vert[(k * n + j) * n + i] };
+        // 取 (cell, 该 cell 内的角点号) 对应的顶点:先在该格查角点所属分量,再取该分量的顶点。
+        let vid = |i: usize, j: usize, k: usize, lc: u8| -> u32 {
+            let c = (k * n + j) * n + i;
+            let comp = cell_label[c * 8 + lc as usize];
+            if comp == u8::MAX {
+                u32::MAX
+            } else {
+                cell_vert[c * 4 + comp as usize]
+            }
+        };
+        // 一条网格棱的 4 个邻 cell 与"负端点在低/高端"时各自的局部角点号。
+        // 角点号约定 bit0=x, bit1=y, bit2=z(与 corner_pos 一致)。
         for k in klo..khi {
             match axis {
                 0 => {
@@ -2823,7 +2835,17 @@ pub mod nets {
                             if (a < 0.0) == (b < 0.0) {
                                 continue;
                             }
-                            let q = [cv(i, j, k), cv(i, j - 1, k), cv(i, j - 1, k - 1), cv(i, j, k - 1)];
+                            let lc: [u8; 4] = if a < 0.0 {
+                                [0, 2, 6, 4]
+                            } else {
+                                [1, 3, 7, 5]
+                            };
+                            let q = [
+                                vid(i, j, k, lc[0]),
+                                vid(i, j - 1, k, lc[1]),
+                                vid(i, j - 1, k - 1, lc[2]),
+                                vid(i, j, k - 1, lc[3]),
+                            ];
                             if q.iter().any(|v| *v == u32::MAX) {
                                 continue;
                             }
@@ -2840,7 +2862,17 @@ pub mod nets {
                             if (a < 0.0) == (b < 0.0) {
                                 continue;
                             }
-                            let q = [cv(i, j, k), cv(i - 1, j, k), cv(i - 1, j, k - 1), cv(i, j, k - 1)];
+                            let lc: [u8; 4] = if a < 0.0 {
+                                [0, 1, 5, 4]
+                            } else {
+                                [2, 3, 7, 6]
+                            };
+                            let q = [
+                                vid(i, j, k, lc[0]),
+                                vid(i - 1, j, k, lc[1]),
+                                vid(i - 1, j, k - 1, lc[2]),
+                                vid(i, j, k - 1, lc[3]),
+                            ];
                             if q.iter().any(|v| *v == u32::MAX) {
                                 continue;
                             }
@@ -2857,7 +2889,17 @@ pub mod nets {
                             if (a < 0.0) == (b < 0.0) {
                                 continue;
                             }
-                            let q = [cv(i, j, k), cv(i - 1, j, k), cv(i - 1, j - 1, k), cv(i, j - 1, k)];
+                            let lc: [u8; 4] = if a < 0.0 {
+                                [0, 1, 3, 2]
+                            } else {
+                                [4, 5, 7, 6]
+                            };
+                            let q = [
+                                vid(i, j, k, lc[0]),
+                                vid(i - 1, j, k, lc[1]),
+                                vid(i - 1, j - 1, k, lc[2]),
+                                vid(i, j - 1, k, lc[3]),
+                            ];
                             if q.iter().any(|v| *v == u32::MAX) {
                                 continue;
                             }
@@ -2909,17 +2951,27 @@ pub mod nets {
         // 2) 变号 cell 一个顶点 = 12 棱交叉点平均(经典 Surface Nets)
         //    按 ck 切 k 平面并行:每片产出**局部**顶点号写入本片 cell_vert,
         //    之后按片序合并(片内顶点先于后片)⟹ 与串行顶点编号逐位一致。
-        let mut cell_vert = vec![u32::MAX; n * n * n];
+        // **每格多顶点**:立方体 8 个角点里,"负角点的边连通分量"最多 4 个
+        // (独立集上界),故每格留 4 个顶点槽;cell_label 记录每个角点属于哪个分量。
+        // 这样两片表面挤进同一个格时各自拿到独立顶点,不会被焊成非流形边。
+        let mut cell_vert = vec![u32::MAX; n * n * n * 4];
+        let mut cell_label = vec![u8::MAX; n * n * n * 8];
         let mut verts: Vec<[f32; 3]> = Vec::new();
         {
             let nslab = n;
-            let mut slabs: Vec<&mut [u32]> = cell_vert.chunks_mut(n * n).collect();
+            let mut slabs: Vec<&mut [u32]> = cell_vert.chunks_mut(n * n * 4).collect();
+            let mut labs: Vec<&mut [u8]> = cell_label.chunks_mut(n * n * 8).collect();
             debug_assert_eq!(slabs.len(), nslab);
             let locals: Vec<std::sync::Mutex<Vec<[f32; 3]>>> =
                 (0..nslab).map(|_| std::sync::Mutex::new(Vec::new())).collect();
-            let mut jobs: Vec<(usize, &mut [u32])> = slabs.drain(..).enumerate().collect();
+            let mut jobs: Vec<(usize, &mut [u32], &mut [u8])> = slabs
+                .drain(..)
+                .zip(labs.drain(..))
+                .enumerate()
+                .map(|(s, (a, b))| (s, a, b))
+                .collect();
             let nt = nthreads().min(nslab).max(1);
-            let mut per: Vec<Vec<(usize, &mut [u32])>> =
+            let mut per: Vec<Vec<(usize, &mut [u32], &mut [u8])>> =
                 (0..nt).map(|_| Vec::new()).collect();
             for (s, job) in jobs.drain(..).enumerate() {
                 per[s % nt].push(job);
@@ -2930,7 +2982,7 @@ pub mod nets {
                 for mine in per.into_iter() {
                     let locals = &locals;
                     sc.spawn(move || {
-                        for (ck, slab) in mine {
+                        for (ck, slab, lab_slab) in mine {
                             let mut out: Vec<[f32; 3]> = Vec::new();
                             for cj in 0..n {
                                 for ci in 0..n {
@@ -2946,111 +2998,158 @@ pub mod nets {
                                     if !(any_neg && any_pos) {
                                         continue;
                                     }
+                                    // 负角点的**边连通分量**(立方体 12 棱) —— 一个分量 = 一片表面
+                                    let mut par = [0u8; 8];
+                                    for i in 0..8 {
+                                        par[i] = i as u8;
+                                    }
+                                    for (a, b) in EDGES {
+                                        if cv[a] < 0.0 && cv[b] < 0.0 {
+                                            let mut ra = a as u8;
+                                            while par[ra as usize] != ra {
+                                                par[ra as usize] = par[par[ra as usize] as usize];
+                                                ra = par[ra as usize];
+                                            }
+                                            let mut rb = b as u8;
+                                            while par[rb as usize] != rb {
+                                                par[rb as usize] = par[par[rb as usize] as usize];
+                                                rb = par[rb as usize];
+                                            }
+                                            if ra != rb {
+                                                par[rb as usize] = ra;
+                                            }
+                                        }
+                                    }
+                                    let mut root_id = [u8::MAX; 8];
+                                    let mut lab = [u8::MAX; 8];
+                                    let mut ncomp = 0u8;
+                                    for i in 0..8 {
+                                        if cv[i] >= 0.0 {
+                                            continue;
+                                        }
+                                        let mut r = i as u8;
+                                        while par[r as usize] != r {
+                                            r = par[r as usize];
+                                        }
+                                        if root_id[r as usize] == u8::MAX {
+                                            root_id[r as usize] = ncomp;
+                                            ncomp += 1;
+                                        }
+                                        lab[i] = root_id[r as usize];
+                                    }
                                     let o = [
                                         vmin[0] + ci as Real * step,
                                         vmin[1] + cj as Real * step,
                                         vmin[2] + ck as Real * step,
                                     ];
-                                    // 顶点定位:**QEF**(dual contouring)而非交叉点平均。
-                                    // 平均法在尖边(曲率半径 < 1 格)处必然"扇贝化":每格的
-                                    // 平均点沿边摆动半个格,叶边于是呈锯齿。QEF 求"到各交叉点
-                                    // 切平面距离平方和"的极小点,顶点会落到两面的交线上,
-                                    // 同样的格宽能还原出锋利边缘。
                                     let od = [o[0] as f64, o[1] as f64, o[2] as f64];
                                     let sd = step as f64;
-                                    let mut cp = [[0f64; 3]; 12];
-                                    let mut cn = [[0f64; 3]; 12];
-                                    let mut cnt = 0usize;
-                                    for (a, b) in EDGES {
-                                        let (va, vb) = (cv[a] as f64, cv[b] as f64);
-                                        if (va < 0.0) == (vb < 0.0) {
-                                            continue;
-                                        }
-                                        let t = va / (va - vb);
-                                        let pa = corner_pos(o, step, a);
-                                        let pb = corner_pos(o, step, b);
-                                        let pt = [
-                                            pa[0] as f64 + (pb[0] - pa[0]) as f64 * t,
-                                            pa[1] as f64 + (pb[1] - pa[1]) as f64 * t,
-                                            pa[2] as f64 + (pb[2] - pa[2]) as f64 * t,
-                                        ];
-                                        let u = [
-                                            (pt[0] - od[0]) / sd,
-                                            (pt[1] - od[1]) / sd,
-                                            (pt[2] - od[2]) / sd,
-                                        ];
-                                        let g = tri_grad(&cv, u, 1.0 / sd);
-                                        let gl = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
-                                        if gl < 1e-9 {
-                                            continue;
-                                        }
-                                        cp[cnt] = pt;
-                                        cn[cnt] = [g[0] / gl, g[1] / gl, g[2] / gl];
-                                        cnt += 1;
-                                    }
-                                    if cnt == 0 {
-                                        continue;
-                                    }
-                                    let mut mass = [0f64; 3];
-                                    for i in 0..cnt {
-                                        for k in 0..3 {
-                                            mass[k] += cp[i][k];
-                                        }
-                                    }
-                                    for k in 0..3 {
-                                        mass[k] /= cnt as f64;
-                                    }
-                                    // A*x = b,即最小化 sum(n.(x-p))^2;lambda 项把解拉向 mass,
-                                    // 保证退化情形(单面、法线共线)不会解到无穷远。
-                                    let mut am = [[0f64; 3]; 3];
-                                    let mut bv = [0f64; 3];
-                                    for i in 0..cnt {
-                                        let n = cn[i];
-                                        let dd = n[0] * cp[i][0] + n[1] * cp[i][1] + n[2] * cp[i][2];
-                                        for r in 0..3 {
-                                            for q in 0..3 {
-                                                am[r][q] += n[r] * n[q];
+                                    // 每个分量各自做一次 QEF,产出自己的顶点
+                                    for comp in 0..ncomp {
+                                        let mut cp = [[0f64; 3]; 12];
+                                        let mut cn = [[0f64; 3]; 12];
+                                        let mut cnt = 0usize;
+                                        for (a, b) in EDGES {
+                                            let (va, vb) = (cv[a] as f64, cv[b] as f64);
+                                            if (va < 0.0) == (vb < 0.0) {
+                                                continue;
                                             }
-                                            bv[r] += n[r] * dd;
+                                            // 交叉点归属"负端点所在的那一片"
+                                            let neg = if va < 0.0 { a } else { b };
+                                            if lab[neg] != comp {
+                                                continue;
+                                            }
+                                            let t = va / (va - vb);
+                                            let pa = corner_pos(o, step, a);
+                                            let pb = corner_pos(o, step, b);
+                                            let pt = [
+                                                pa[0] as f64 + (pb[0] - pa[0]) as f64 * t,
+                                                pa[1] as f64 + (pb[1] - pa[1]) as f64 * t,
+                                                pa[2] as f64 + (pb[2] - pa[2]) as f64 * t,
+                                            ];
+                                            let u = [
+                                                (pt[0] - od[0]) / sd,
+                                                (pt[1] - od[1]) / sd,
+                                                (pt[2] - od[2]) / sd,
+                                            ];
+                                            let g = tri_grad(&cv, u, 1.0 / sd);
+                                            let gl = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+                                            if gl < 1e-9 {
+                                                continue;
+                                            }
+                                            cp[cnt] = pt;
+                                            cn[cnt] = [g[0] / gl, g[1] / gl, g[2] / gl];
+                                            cnt += 1;
                                         }
-                                    }
-                                    let lam = 0.01 * (am[0][0] + am[1][1] + am[2][2]) / 3.0 + 1e-9;
-                                    for k in 0..3 {
-                                        am[k][k] += lam;
-                                        bv[k] += lam * mass[k];
-                                    }
-                                    let det = am[0][0] * (am[1][1] * am[2][2] - am[1][2] * am[2][1])
-                                        - am[0][1] * (am[1][0] * am[2][2] - am[1][2] * am[2][0])
-                                        + am[0][2] * (am[1][0] * am[2][1] - am[1][1] * am[2][0]);
-                                    let mut pos = mass;
-                                    if det.abs() > 1e-12 {
+                                        if cnt == 0 {
+                                            continue;
+                                        }
+                                        let mut mass = [0f64; 3];
+                                        for i in 0..cnt {
+                                            for k in 0..3 {
+                                                mass[k] += cp[i][k];
+                                            }
+                                        }
                                         for k in 0..3 {
-                                            // Cramer:把第 k 列换成 bv
-                                            let mut m = am;
+                                            mass[k] /= cnt as f64;
+                                        }
+                                        let mut am = [[0f64; 3]; 3];
+                                        let mut bv = [0f64; 3];
+                                        for i in 0..cnt {
+                                            let nn = cn[i];
+                                            let dd = nn[0] * cp[i][0]
+                                                + nn[1] * cp[i][1]
+                                                + nn[2] * cp[i][2];
                                             for r in 0..3 {
-                                                m[r][k] = bv[r];
+                                                for q in 0..3 {
+                                                    am[r][q] += nn[r] * nn[q];
+                                                }
+                                                bv[r] += nn[r] * dd;
                                             }
-                                            let dk = m[0][0]
-                                                * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-                                                - m[0][1]
-                                                    * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-                                                + m[0][2]
-                                                    * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-                                            pos[k] = dk / det;
                                         }
-                                    }
-                                    // 越界(超出本格)退回 mass —— QEF 在薄壁两侧会解到格外
-                                    for k in 0..3 {
-                                        if !pos[k].is_finite()
-                                            || pos[k] < od[k] - 1e-9
-                                            || pos[k] > od[k] + sd + 1e-9
-                                        {
-                                            pos = mass;
-                                            break;
+                                        let lam =
+                                            0.01 * (am[0][0] + am[1][1] + am[2][2]) / 3.0 + 1e-9;
+                                        for k in 0..3 {
+                                            am[k][k] += lam;
+                                            bv[k] += lam * mass[k];
                                         }
+                                        let det = am[0][0]
+                                            * (am[1][1] * am[2][2] - am[1][2] * am[2][1])
+                                            - am[0][1]
+                                                * (am[1][0] * am[2][2] - am[1][2] * am[2][0])
+                                            + am[0][2]
+                                                * (am[1][0] * am[2][1] - am[1][1] * am[2][0]);
+                                        let mut pos = mass;
+                                        if det.abs() > 1e-12 {
+                                            for k in 0..3 {
+                                                let mut m = am;
+                                                for r in 0..3 {
+                                                    m[r][k] = bv[r];
+                                                }
+                                                let dk = m[0][0]
+                                                    * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                                                    - m[0][1]
+                                                        * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                                                    + m[0][2]
+                                                        * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+                                                pos[k] = dk / det;
+                                            }
+                                        }
+                                        for k in 0..3 {
+                                            if !pos[k].is_finite()
+                                                || pos[k] < od[k] - 1e-9
+                                                || pos[k] > od[k] + sd + 1e-9
+                                            {
+                                                pos = mass;
+                                                break;
+                                            }
+                                        }
+                                        slab[(cj * n + ci) * 4 + comp as usize] = out.len() as u32;
+                                        out.push([pos[0] as f32, pos[1] as f32, pos[2] as f32]);
                                     }
-                                    slab[cj * n + ci] = out.len() as u32; // 局部号
-                                    out.push([pos[0] as f32, pos[1] as f32, pos[2] as f32]);
+                                    for c in 0..8 {
+                                        lab_slab[(cj * n + ci) * 8 + c] = lab[c];
+                                    }
                                 }
                             }
                             *locals[ck].lock().unwrap() = out;
@@ -3062,8 +3161,8 @@ pub mod nets {
             for s in 0..nslab {
                 let off = verts.len() as u32;
                 let mut loc = locals[s].lock().unwrap();
-                let base = s * n * n;
-                for e in cell_vert[base..base + n * n].iter_mut() {
+                let base = s * n * n * 4;
+                for e in cell_vert[base..base + n * n * 4].iter_mut() {
                     if *e != u32::MAX {
                         *e += off;
                     }
@@ -3091,6 +3190,7 @@ pub mod nets {
                     let locals = &locals;
                     let vals = &vals;
                     let cell_vert = &cell_vert;
+                    let cell_label = &cell_label;
                     let verts = &verts;
                     sc.spawn(move || {
                         let mut s = w;
@@ -3104,6 +3204,7 @@ pub mod nets {
                                 dim,
                                 vals,
                                 cell_vert,
+                                cell_label,
                                 verts,
                                 &mut out,
                             );
