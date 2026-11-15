@@ -83,6 +83,13 @@ fn main() {
     if nt > 0 {
         println!("[clean] 丢弃碎屑分量 {nd} 个 / 三角 {nt}");
     }
+    // 平滑 + 投影回零等值面:削掉叶边处的扇贝锯齿(位移上限 = 半格)
+    let t2 = Instant::now();
+    let (dm, dx) = mesh.smooth_and_project(&adf, 3, h_ext as f32 * 0.5);
+    println!(
+        "[smooth] {:?} | 位移 mean {dm:.4} max {dx:.4} mm",
+        t2.elapsed()
+    );
     let (open, nonman, comps) = mesh.edge_stats();
     let vol = mesh.signed_volume().abs();
     println!(

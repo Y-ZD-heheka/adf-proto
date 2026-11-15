@@ -922,6 +922,28 @@ fn corner_pos(o: [Real; 3], s: Real, k: usize) -> [Real; 3] {
     ]
 }
 
+/// 单元格内三线性场的解析梯度(供 QEF 的切平面法线用)。
+/// `u` 属于 [0,1]^3 为格内坐标,`inv_step` = 1/格宽,返回世界坐标梯度(mm^-1)。
+fn tri_grad(cv: &[f32; 8], u: [f64; 3], inv_step: f64) -> [f64; 3] {
+    let mut g = [0.0f64; 3];
+    for (i, &c) in cv.iter().enumerate() {
+        let dx = (i & 1) as usize;
+        let dy = ((i >> 1) & 1) as usize;
+        let dz = ((i >> 2) & 1) as usize;
+        let wx = if dx == 1 { u[0] } else { 1.0 - u[0] };
+        let wy = if dy == 1 { u[1] } else { 1.0 - u[1] };
+        let wz = if dz == 1 { u[2] } else { 1.0 - u[2] };
+        let sx = if dx == 1 { 1.0 } else { -1.0 };
+        let sy = if dy == 1 { 1.0 } else { -1.0 };
+        let sz = if dz == 1 { 1.0 } else { -1.0 };
+        let c = c as f64;
+        g[0] += c * sx * wy * wz;
+        g[1] += c * wx * sy * wz;
+        g[2] += c * wx * wy * sz;
+    }
+    [g[0] * inv_step, g[1] * inv_step, g[2] * inv_step]
+}
+
 #[inline]
 fn child_origin(o: [Real; 3], s: Real, i: usize) -> [Real; 3] {
     let h = s * 0.5;
@@ -2471,6 +2493,142 @@ pub mod nets {
             flipped
         }
 
+        /// **平滑 + 投影回零等值面**:削掉 Surface Nets 在薄壁/叶边处的锯齿尖刺。
+        ///
+        /// 为什么只做"平滑 + 投影"而不只是平滑:尖刺是**顶点定位**误差,场在表面附近
+        /// 是准的(实测 mean 0.0023mm),所以平滑把顶点往邻域均值拉之后,再用
+        /// Newton 步 `p -= d·∇d/|∇d|²` 把它拉回零等值面 —— 形状不被磨圆掉,
+        /// 只把"出格"的顶点收回来。
+        ///
+        /// 参数:`iters` 次 Taubin(λ=0.5, μ=−0.53,交替做**不收缩**的平滑),
+        /// 位移上限 `max_disp`(按顶点原始位置钳住,避免薄壁被抹平)。
+        /// 返回(平均位移, 最大位移)mm。
+        pub fn smooth_and_project(&mut self, adf: &Adf, iters: usize, max_disp: f32) -> (f64, f64) {
+            let n = self.verts.len();
+            if n == 0 || self.tris.is_empty() {
+                return (0.0, 0.0);
+            }
+            // 顶点邻接(CSR):每个三角给三个顶点各贡献 2 个邻居
+            let mut deg = vec![0u32; n];
+            for t in &self.tris {
+                for i in 0..3 {
+                    deg[t[i] as usize] += 2;
+                }
+            }
+            let mut off = vec![0u32; n + 1];
+            for i in 0..n {
+                off[i + 1] = off[i] + deg[i];
+            }
+            let mut adj = vec![0u32; off[n] as usize];
+            let mut cur = off.clone();
+            for t in &self.tris {
+                for i in 0..3 {
+                    let a = t[i] as usize;
+                    adj[cur[a] as usize] = t[(i + 1) % 3];
+                    adj[cur[a] as usize + 1] = t[(i + 2) % 3];
+                    cur[a] += 2;
+                }
+            }
+            let orig: Vec<[f32; 3]> = self.verts.clone();
+            let mut p: Vec<[f64; 3]> = self
+                .verts
+                .iter()
+                .map(|v| [v[0] as f64, v[1] as f64, v[2] as f64])
+                .collect();
+            let mut tmp = p.clone();
+            let lap = |p: &Vec<[f64; 3]>, f: f64, out: &mut Vec<[f64; 3]>| {
+                for i in 0..n {
+                    let (s0, s1) = (off[i] as usize, off[i + 1] as usize);
+                    let k = (s1 - s0) as f64;
+                    if k == 0.0 {
+                        out[i] = p[i];
+                        continue;
+                    }
+                    let (mut ax, mut ay, mut az) = (0.0, 0.0, 0.0);
+                    for &j in &adj[s0..s1] {
+                        let q = p[j as usize];
+                        ax += q[0];
+                        ay += q[1];
+                        az += q[2];
+                    }
+                    out[i][0] = p[i][0] + f * (ax / k - p[i][0]);
+                    out[i][1] = p[i][1] + f * (ay / k - p[i][1]);
+                    out[i][2] = p[i][2] + f * (az / k - p[i][2]);
+                }
+            };
+            for _ in 0..iters {
+                lap(&p, 0.5, &mut tmp);
+                std::mem::swap(&mut p, &mut tmp);
+                lap(&p, -0.53, &mut tmp);
+                std::mem::swap(&mut p, &mut tmp);
+            }
+            // 位移上限(防止薄壁被抹平):按原始位置钳住
+            for i in 0..n {
+                let d = [
+                    p[i][0] - orig[i][0] as f64,
+                    p[i][1] - orig[i][1] as f64,
+                    p[i][2] - orig[i][2] as f64,
+                ];
+                let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                if len > max_disp as f64 {
+                    let s = max_disp as f64 / len;
+                    for k in 0..3 {
+                        p[i][k] = orig[i][k] as f64 + d[k] * s;
+                    }
+                }
+            }
+            // Newton 投影回零等值面:2 步,梯度用前向差分
+            let hstep = 1e-3 * adf.size;
+            for _ in 0..2 {
+                for i in 0..n {
+                    let q = [p[i][0], p[i][1], p[i][2]];
+                    let d0 = adf.eval(q) as f64;
+                    if d0.abs() > 4.0 * max_disp as f64 {
+                        continue; // 离面太远,不投影(应为碎屑或退化点)
+                    }
+                    let mut g = [0.0f64; 3];
+                    for k in 0..3 {
+                        let mut qq = q;
+                        qq[k] += hstep;
+                        g[k] = (adf.eval(qq) as f64 - d0) / hstep;
+                    }
+                    let g2 = g[0] * g[0] + g[1] * g[1] + g[2] * g[2];
+                    // |∇d| 应≈1;远小于 1 说明落在场的奇异处,投影会把点甩得很远
+                    if g2 < 0.25 {
+                        continue;
+                    }
+                    // 单步位移限制在 max_disp 内,防止一步跳出模型
+                    let mut step = [0.0f64; 3];
+                    for k in 0..3 {
+                        step[k] = -d0 * g[k] / g2;
+                    }
+                    let sl = (step[0] * step[0] + step[1] * step[1] + step[2] * step[2]).sqrt();
+                    if sl > max_disp as f64 {
+                        let f = max_disp as f64 / sl;
+                        for k in 0..3 {
+                            step[k] *= f;
+                        }
+                    }
+                    for k in 0..3 {
+                        p[i][k] = q[k] + step[k];
+                    }
+                }
+            }
+            let (mut sum, mut mx) = (0.0f64, 0.0f64);
+            for i in 0..n {
+                let d = [
+                    p[i][0] - orig[i][0] as f64,
+                    p[i][1] - orig[i][1] as f64,
+                    p[i][2] - orig[i][2] as f64,
+                ];
+                let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                sum += len;
+                mx = mx.max(len);
+                self.verts[i] = [p[i][0] as f32, p[i][1] as f32, p[i][2] as f32];
+            }
+            (sum / n as f64, mx)
+        }
+
         /// 丢弃**碎屑分量**:三角数 < `min_tris`,**或**体积 < `min_vol_frac` × 总体积。
         /// 这类分量是场里孤立的小符号岛,在查看器里表现为浮在表面的斑点;切片软件
         /// 通常也直接忽略。用"相对体积"而不只看三角数,是因为三角数与网格密度挂钩
@@ -2793,26 +2951,106 @@ pub mod nets {
                                         vmin[1] + cj as Real * step,
                                         vmin[2] + ck as Real * step,
                                     ];
-                                    let (mut vx, mut vy, mut vz) = (0.0, 0.0, 0.0);
-                                    let mut cnt = 0u32;
+                                    // 顶点定位:**QEF**(dual contouring)而非交叉点平均。
+                                    // 平均法在尖边(曲率半径 < 1 格)处必然"扇贝化":每格的
+                                    // 平均点沿边摆动半个格,叶边于是呈锯齿。QEF 求"到各交叉点
+                                    // 切平面距离平方和"的极小点,顶点会落到两面的交线上,
+                                    // 同样的格宽能还原出锋利边缘。
+                                    let od = [o[0] as f64, o[1] as f64, o[2] as f64];
+                                    let sd = step as f64;
+                                    let mut cp = [[0f64; 3]; 12];
+                                    let mut cn = [[0f64; 3]; 12];
+                                    let mut cnt = 0usize;
                                     for (a, b) in EDGES {
-                                        let (va, vb) = (cv[a] as Real, cv[b] as Real);
-                                        if (va < 0.0) != (vb < 0.0) {
-                                            let t = va / (va - vb);
-                                            let pa = corner_pos(o, step, a);
-                                            let pb = corner_pos(o, step, b);
-                                            vx += pa[0] + (pb[0] - pa[0]) * t;
-                                            vy += pa[1] + (pb[1] - pa[1]) * t;
-                                            vz += pa[2] + (pb[2] - pa[2]) * t;
-                                            cnt += 1;
+                                        let (va, vb) = (cv[a] as f64, cv[b] as f64);
+                                        if (va < 0.0) == (vb < 0.0) {
+                                            continue;
                                         }
+                                        let t = va / (va - vb);
+                                        let pa = corner_pos(o, step, a);
+                                        let pb = corner_pos(o, step, b);
+                                        let pt = [
+                                            pa[0] as f64 + (pb[0] - pa[0]) as f64 * t,
+                                            pa[1] as f64 + (pb[1] - pa[1]) as f64 * t,
+                                            pa[2] as f64 + (pb[2] - pa[2]) as f64 * t,
+                                        ];
+                                        let u = [
+                                            (pt[0] - od[0]) / sd,
+                                            (pt[1] - od[1]) / sd,
+                                            (pt[2] - od[2]) / sd,
+                                        ];
+                                        let g = tri_grad(&cv, u, 1.0 / sd);
+                                        let gl = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+                                        if gl < 1e-9 {
+                                            continue;
+                                        }
+                                        cp[cnt] = pt;
+                                        cn[cnt] = [g[0] / gl, g[1] / gl, g[2] / gl];
+                                        cnt += 1;
                                     }
                                     if cnt == 0 {
                                         continue;
                                     }
-                                    let c = cnt as Real;
+                                    let mut mass = [0f64; 3];
+                                    for i in 0..cnt {
+                                        for k in 0..3 {
+                                            mass[k] += cp[i][k];
+                                        }
+                                    }
+                                    for k in 0..3 {
+                                        mass[k] /= cnt as f64;
+                                    }
+                                    // A*x = b,即最小化 sum(n.(x-p))^2;lambda 项把解拉向 mass,
+                                    // 保证退化情形(单面、法线共线)不会解到无穷远。
+                                    let mut am = [[0f64; 3]; 3];
+                                    let mut bv = [0f64; 3];
+                                    for i in 0..cnt {
+                                        let n = cn[i];
+                                        let dd = n[0] * cp[i][0] + n[1] * cp[i][1] + n[2] * cp[i][2];
+                                        for r in 0..3 {
+                                            for q in 0..3 {
+                                                am[r][q] += n[r] * n[q];
+                                            }
+                                            bv[r] += n[r] * dd;
+                                        }
+                                    }
+                                    let lam = 0.01 * (am[0][0] + am[1][1] + am[2][2]) / 3.0 + 1e-9;
+                                    for k in 0..3 {
+                                        am[k][k] += lam;
+                                        bv[k] += lam * mass[k];
+                                    }
+                                    let det = am[0][0] * (am[1][1] * am[2][2] - am[1][2] * am[2][1])
+                                        - am[0][1] * (am[1][0] * am[2][2] - am[1][2] * am[2][0])
+                                        + am[0][2] * (am[1][0] * am[2][1] - am[1][1] * am[2][0]);
+                                    let mut pos = mass;
+                                    if det.abs() > 1e-12 {
+                                        for k in 0..3 {
+                                            // Cramer:把第 k 列换成 bv
+                                            let mut m = am;
+                                            for r in 0..3 {
+                                                m[r][k] = bv[r];
+                                            }
+                                            let dk = m[0][0]
+                                                * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                                                - m[0][1]
+                                                    * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                                                + m[0][2]
+                                                    * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+                                            pos[k] = dk / det;
+                                        }
+                                    }
+                                    // 越界(超出本格)退回 mass —— QEF 在薄壁两侧会解到格外
+                                    for k in 0..3 {
+                                        if !pos[k].is_finite()
+                                            || pos[k] < od[k] - 1e-9
+                                            || pos[k] > od[k] + sd + 1e-9
+                                        {
+                                            pos = mass;
+                                            break;
+                                        }
+                                    }
                                     slab[cj * n + ci] = out.len() as u32; // 局部号
-                                    out.push([(vx / c) as f32, (vy / c) as f32, (vz / c) as f32]);
+                                    out.push([pos[0] as f32, pos[1] as f32, pos[2] as f32]);
                                 }
                             }
                             *locals[ck].lock().unwrap() = out;

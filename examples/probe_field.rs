@@ -88,6 +88,64 @@ fn main() {
         max_e = max_e.max(e);
         cnt += 1;
     }
+    // ── 局部壁厚:从表面点沿法线向内走到另一侧 ──
+    {
+        let mut rng = Rng::new(4242);
+        let mut th: Vec<f64> = Vec::new();
+        while th.len() < 400 {
+            let p = [
+                min[0] + rng.f01() * size,
+                min[1] + rng.f01() * size,
+                min[2] + rng.f01() * size,
+            ];
+            let d = adf.field.base.sd(p) as f64;
+            // 只取"表面内一侧"的点(否则射线先穿过自己脚下那层表面)
+            if d > -0.005 || d < -0.1 {
+                continue;
+            }
+            // 数值梯度当法线
+            let h = 0.01;
+            let mut g = [0.0f64; 3];
+            for k in 0..3 {
+                let mut q = p;
+                q[k] += h;
+                g[k] = (adf.field.base.sd(q) as f64 - d) / h;
+            }
+            let gl = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+            if gl < 0.5 {
+                continue;
+            }
+            let n = [g[0] / gl, g[1] / gl, g[2] / gl];
+            // 永远朝"材料内部"(梯度反方向)走,找对面那层表面
+            let sgn = -1.0;
+            let mut t = 0.0;
+            let mut hit = -1.0;
+            while t < 3.0 {
+                t += 0.02;
+                let q = [
+                    p[0] + sgn * n[0] * t,
+                    p[1] + sgn * n[1] * t,
+                    p[2] + sgn * n[2] * t,
+                ];
+                if (adf.field.base.sd(q) as f64) * d < 0.0 {
+                    hit = t;
+                    break;
+                }
+            }
+            if hit > 0.0 {
+                th.push(hit);
+            }
+        }
+        th.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "[probe.thick] 局部壁厚 {} 点: p10 {:.3} 中位 {:.3} p90 {:.3} max {:.3} mm",
+            th.len(),
+            th[th.len() / 10],
+            th[th.len() / 2],
+            th[th.len() * 9 / 10],
+            th.last().copied().unwrap_or(0.0)
+        );
+    }
     println!(
         "[probe.near] 表面邻域(|d|≤0.6mm){cnt} 点:符号错 {sign_bad}({:.2}%)| max {max_e:.4} mean {:.4}",
         sign_bad as f64 / cnt.max(1) as f64 * 100.0,
@@ -101,6 +159,18 @@ fn main() {
         let (open, nonman, comps) = m.edge_stats();
         let v = m.signed_volume().abs();
         // 顶点到真表面的距离:表面质量的直接度量(尖刺/塌陷都会顶出来)
+        let dev_of = |m: &nets::Mesh| -> Vec<f64> {
+            let mut v: Vec<f64> = Vec::new();
+            for (i, vtx) in m.verts.iter().enumerate() {
+                if i % 5 != 0 {
+                    continue;
+                }
+                let p = [vtx[0] as Real, vtx[1] as Real, vtx[2] as Real];
+                v.push(adf.field.base.sd(p).abs() as f64);
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v
+        };
         let mut devs: Vec<f64> = Vec::new();
         for (i, vtx) in m.verts.iter().enumerate() {
             if i % 5 != 0 {
@@ -166,6 +236,27 @@ fn main() {
             mx = devs.last().copied().unwrap_or(0.0),
             n = devs.len(),
             pct = bad as f64 / devs.len() as f64 * 100.0
+        );
+        // 平滑 + 投影后再测一遍(评估后处理收益)
+        let mut m2 = m;
+        let t2 = std::time::Instant::now();
+        let (dm, dx) = m2.smooth_and_project(&adf, 3, h_min as f32 * 1.0);
+        let el = t2.elapsed();
+        let d2 = dev_of(&m2);
+        let mean2 = d2.iter().sum::<f64>() / d2.len() as f64;
+        let bad2 = d2.iter().filter(|x| **x > 0.5).count();
+        let v2 = m2.signed_volume().abs();
+        let (o2, nm2, c2) = m2.edge_stats();
+        println!(
+            "  → 平滑+投影({el:?},位移 mean {dm:.4} max {dx:.4}):mean {mean2:.4} p99 {:.4} max {:.4} mm | >0.5mm {bad2}/{n} ({pct2:.2}%)",
+            d2[(d2.len() as f64 * 0.99) as usize],
+            d2.last().copied().unwrap_or(0.0),
+            n = d2.len(),
+            pct2 = bad2 as f64 / d2.len() as f64 * 100.0
+        );
+        println!(
+            "  → 体积 {v2:.1}({:+.2}%)| 开放边 {o2} 非流形 {nm2} 分量 {c2}",
+            (v2 - vol_in) / vol_in * 100.0
         );
     }
 }
