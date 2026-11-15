@@ -219,12 +219,12 @@ fn main() {
         // 脊线重吸附(消除锐边锯齿阶梯的短黑线;见 stl_roundtrip 注释)
         if std::env::var("ADF_NO_SNAP2").is_err() {
             let ns = mesh.snap_sharp_to_rim(&adf, 0.5, 0.95);
-            let nsl = mesh.collapse_slivers(0.015, 4);
+            let nsl = mesh.collapse_slivers_ex(0.02, 6, 0.08, 0.3);
             println!("[snap2] 重吸附 {ns} 锐边顶点,清薄片 {nsl}");
             // 真折叠修复(场梯度仲裁)+ 清薄片 + 重吸附(见 stl_roundtrip 注释)
             if std::env::var("ADF_NO_REPAIR2").is_err() {
                 let (nc2, nr2) = mesh.repair_folds(&adf, 0.5, 0.004, 0.002, h_ext as f64 * 4.0, 10);
-                let nsl2 = mesh.collapse_slivers(0.015, 4);
+                let nsl2 = mesh.collapse_slivers_ex(0.02, 6, 0.08, 0.3);
                 let ns2 = mesh.snap_sharp_to_rim(&adf, 0.5, 0.95);
                 println!("[repair2] 折叠塌缩 {nc2},删面 {nr2},清薄片 {nsl2},重吸附 {ns2}");
             }

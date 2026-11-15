@@ -3843,11 +3843,12 @@ pub mod nets {
                 let ab = [bf[0] - af[0], bf[1] - af[1], bf[2] - af[2]];
                 let lab = (ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2]).sqrt();
                 // 滑动钳制:平坦方向二次型几乎无成本,求解位置会被甩出表面
-                // (桌腿实测甩出 5.5mm)——钳到中点邻域 2.5×|ab|,钳后重估成本
+                // (桌腿实测甩出 5.5mm)——钳到中点邻域 1.5×|ab|(2.5 时顶点
+                // 链式迁移能漂移几十 mm,配纵横比守卫双保险),钳后重估成本
                 let clamp_mid = |v: [f64; 3]| -> [f64; 3] {
                     let d = [v[0] - mid[0], v[1] - mid[1], v[2] - mid[2]];
                     let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                    let lim = 2.5 * lab;
+                    let lim = 1.5 * lab;
                     if l <= lim || l < 1e-12 {
                         v
                     } else {
@@ -4024,8 +4025,14 @@ pub mod nets {
                     self.verts[b as usize],
                 );
                 let _ = cost2;
-                // 翻转检查:环绕三角新法线不与旧法线反向
-                let newn = |ti: u32| -> Option<[f64; 3]> {
+                // 翻转检查 + 纵横比守卫:环绕三角(含 b→pos 代换)新法线
+                // 不与旧法线反向;非脊线塌缩还要求新三角不过分细长。
+                let mut flip = false;
+                let mut ugly = false;
+                for &ti in v2t[a as usize].iter().chain(v2t[b as usize].iter()) {
+                    if dead_tri[ti as usize] || shared.contains(&ti) {
+                        continue;
+                    }
                     let t = self.tris[ti as usize];
                     let mut pv = [[0.0f64; 3]; 3];
                     for k in 0..3 {
@@ -4046,24 +4053,35 @@ pub mod nets {
                     ];
                     let l = (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]).sqrt();
                     if l < 1e-12 {
-                        return None;
+                        flip = true;
+                        break;
                     }
-                    Some([cr[0] / l, cr[1] / l, cr[2] / l])
-                };
-                let mut flip = false;
-                for &ti in v2t[a as usize].iter().chain(v2t[b as usize].iter()) {
-                    if dead_tri[ti as usize] || shared.contains(&ti) {
-                        continue;
+                    let nw = [cr[0] / l, cr[1] / l, cr[2] / l];
+                    let on = tri_n[ti as usize];
+                    if nw[0] * on[0] + nw[1] * on[1] + nw[2] * on[2] < 0.2 {
+                        flip = true;
+                        break;
                     }
-                    if let Some(nw) = newn(ti) {
-                        let on = tri_n[ti as usize];
-                        if nw[0] * on[0] + nw[1] * on[1] + nw[2] * on[2] < 0.2 {
-                            flip = true;
+                    // 纵横比守卫:平坦区二次型简并,顶点沿面链式滑移,环三角
+                    // 被拉成细长穿越三角(实测铺满整个盘面)。归一化纵横比 =
+                    // 最小高度/最长边 = |叉积|/最长边²(等边 0.866);< 0.08
+                    // 拒绝。注意是除以 emax²——除以 emax 得到的是绝对高度,
+                    // 会把 h=0.09 网格的健康三角(高度≈0.05)全部误杀
+                    // (实测:叶轮塌缩 384 万→5.3 万)。脊线边(thr 放宽档)
+                    // 豁免——缘带长三角合法。
+                    if thr <= err2_max {
+                        let e0 = (ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2]).sqrt();
+                        let e1 = (ac[0] * ac[0] + ac[1] * ac[1] + ac[2] * ac[2]).sqrt();
+                        let bc = [pv[2][0] - pv[1][0], pv[2][1] - pv[1][1], pv[2][2] - pv[1][2]];
+                        let e2 = (bc[0] * bc[0] + bc[1] * bc[1] + bc[2] * bc[2]).sqrt();
+                        let emax = e0.max(e1).max(e2);
+                        if emax > 1e-12 && l / (emax * emax) < 0.08 {
+                            ugly = true;
                             break;
                         }
                     }
                 }
-                if flip {
+                if flip || ugly {
                     // 拒绝塌缩:永久封禁该边(保守;邻域塌缩后仍封禁,
                     // 避免同条目反复弹出)。封禁不 bump 版本——邻边条目仍有效。
                     banned.insert(if a < b { ((a as u64) << 32) | b as u64 } else { ((b as u64) << 32) | a as u64 });
@@ -4189,6 +4207,20 @@ pub mod nets {
         /// 翻转拒绝与 1-环保留(与 `repair_folds` 同一套安全机制,但不依赖场)。
         /// 返回塌缩次数。
         pub fn collapse_slivers(&mut self, sliver_h: f64, passes: usize) -> usize {
+            self.collapse_slivers_ex(sliver_h, passes, 0.0, 0.0)
+        }
+
+        /// 扩展版:额外按**归一化纵横比**(最小高度/最长边 = 2·面积/最长边²)
+        /// 塌缩"大而扁"的三角(repair2 的折叠塌缩无形状守卫,会在平面挤出
+        /// 4mm×0.07mm 细长条——绝对高度判据 hmin<0.02 抓不到它们)。
+        /// aspect_lim<=0 或 min_area2<=0 时关闭该判据。
+        pub fn collapse_slivers_ex(
+            &mut self,
+            sliver_h: f64,
+            passes: usize,
+            aspect_lim: f64,
+            min_area2: f64,
+        ) -> usize {
             let mut total = 0usize;
             for _p in 0..passes {
                 let n_t = self.tris.len();
@@ -4196,6 +4228,8 @@ pub mod nets {
                 // 高度 + 最短边(黑线 = 退化三角的短边)
                 let mut hmin = vec![f64::INFINITY; n_t];
                 let mut emin = vec![f64::INFINITY; n_t];
+                let mut emax_v = vec![0.0f64; n_t];
+                let mut area2_v = vec![0.0f64; n_t];
                 for (ti, t) in self.tris.iter().enumerate() {
                     let (a, b, c) = (
                         self.verts[t[0] as usize],
@@ -4222,6 +4256,8 @@ pub mod nets {
                     let emax = e1.max(e2).max(e3);
                     hmin[ti] = if emax > 1e-12 { l / emax } else { 0.0 };
                     emin[ti] = e1.min(e2).min(e3);
+                    emax_v[ti] = emax;
+                    area2_v[ti] = l;
                 }
                 // 邻接与边表(带计数)
                 let mut v2t: Vec<Vec<u32>> = vec![Vec::new(); nv];
@@ -4293,7 +4329,10 @@ pub mod nets {
                     .collect();
                 let mut n_collapsed = 0usize;
                 for (ti, _) in self.tris.iter().enumerate() {
-                    if used_t[ti] || (hmin[ti] >= sliver_h && emin[ti] >= 0.02) {
+                    let fat = aspect_lim > 0.0
+                        && hmin[ti] / emax_v[ti].max(1e-12) < aspect_lim
+                        && area2_v[ti] > min_area2;
+                    if used_t[ti] || (!fat && hmin[ti] >= sliver_h && emin[ti] >= 0.02) {
                         continue;
                     }
                     let tri = self.tris[ti];
