@@ -54,9 +54,16 @@ fn main() {
         band,
         max_depth,
     );
-    let (nl, nb, _) = adf.leaf_stats_bytes();
+    let (nl, nb, hist) = adf.leaf_stats_bytes();
     let kb = nb / 1024;
     println!("[build] {:?} | 叶 {nl} | ≈{kb} KB", t.elapsed());
+    {
+        let rows: Vec<String> = (0..17u8)
+            .filter(|d| hist[*d as usize] > 0)
+            .map(|d| format!("d{d}:{}", hist[d as usize]))
+            .collect();
+        println!("[leaves] 按深度 {}", rows.join(" "));
+    }
     if let Some(la) = &adf.lattice {
         let (comp, pages, bytes) = la.stats();
         let mb = bytes / (1024 * 1024);

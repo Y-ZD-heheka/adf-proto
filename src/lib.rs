@@ -404,6 +404,7 @@ impl BakeGrid {
         }
         self.data[self.idx(g[0], g[1], g[2])] as Real
     }
+
 }
 
 /// 1D 平方距离变换(Felzenszwalb & Huttenlocher 2012 思想,自实现):
@@ -1719,6 +1720,11 @@ impl Adf {
         loop {
             match self.nodes[idx as usize] {
                 Node::Leaf(c) => {
+                    // 远场粗叶的插值误差**不能**靠"改读烘焙网格"解决(P6 已否决):
+                    // 实测叶轮 77% 体积由 d4 叶覆盖(阈值内),改用网格三线性后
+                    // [error] 仅 8.77 → 8.88mm;把网格提到 257³ 也只到 8.42mm,
+                    // 而 bake 涨 4×。说明误差源是**网格自身的符号**(薄壁件上 EDT 的
+                    // 最近站符号会取反,max ≈ 2×距离),不是插值或分辨率。见 P5。
                     let u = [(q[0] - o[0]) / s, (q[1] - o[1]) / s, (q[2] - o[2]) / s];
                     return trilinear(u, &c);
                 }
