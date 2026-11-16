@@ -4673,6 +4673,18 @@ pub mod nets {
         (0, 4), (1, 5), (2, 6), (3, 7), // z 向
     ];
 
+    /// 立方体 6 个面:**环序角点** + 对应棱(`e[i]` 连接 `c[i]` 与 `c[i+1]`)。
+    /// 用于"一片表面"的面内连通判定:面的 4 个角点值只有共享它的两格完全一致,
+    /// 因此在此面内做的连通决策跨格天然一致(见 `extract_uniform` 步骤 2)。
+    const FACES: [([usize; 4], [usize; 4]); 6] = [
+        ([0, 2, 6, 4], [4, 10, 6, 8]),  // x = 0
+        ([1, 3, 7, 5], [5, 11, 7, 9]),  // x = 1
+        ([0, 1, 5, 4], [0, 9, 2, 8]),   // y = 0
+        ([2, 3, 7, 6], [1, 11, 3, 10]), // y = 1
+        ([0, 1, 3, 2], [0, 5, 1, 4]),   // z = 0
+        ([4, 5, 7, 6], [2, 7, 3, 6]),   // z = 1
+    ];
+
     /// quad 按需翻转:使三角形法向朝 want 方向(消除绕向猜测)。
     fn push_quad(verts: &[[f32; 3]], q: [u32; 4], want: [f64; 3], tris: &mut Vec<[u32; 3]>) {
         let (v0, v1, v2) = (g64(verts[q[0] as usize]), g64(verts[q[1] as usize]), g64(verts[q[2] as usize]));
@@ -4698,22 +4710,24 @@ pub mod nets {
         dim: usize,
         vals: &[f32],
         cell_vert: &[u32],
-        cell_label: &[u8],
+        cell_pack: &[u64],
         verts: &[[f32; 3]],
         out: &mut Vec<[u32; 3]>,
     ) {
-        // 取 (cell, 该 cell 内的角点号) 对应的顶点:先在该格查角点所属分量,再取该分量的顶点。
-        let vid = |i: usize, j: usize, k: usize, lc: u8| -> u32 {
+        // 取 (cell, 该 cell 内的棱号) 对应的顶点:4 bit 槽号 → 槽内顶点号。
+        // 棱号直接取自"这条网格棱在该格内是哪条棱",与端点符号无关 ⟹ 四邻格
+        // 各自查到的都是"包含该交叉点的那片表面",不会再跨片错接。
+        let vid = |i: usize, j: usize, k: usize, e: usize| -> u32 {
             let c = (k * n + j) * n + i;
-            let comp = cell_label[c * 8 + lc as usize];
-            if comp == u8::MAX {
+            let s = (cell_pack[c] >> (4 * e)) & 0xF;
+            if s == 0 {
                 u32::MAX
             } else {
-                cell_vert[c * 4 + comp as usize]
+                cell_vert[c * 4 + (s - 1) as usize]
             }
         };
-        // 一条网格棱的 4 个邻 cell 与"负端点在低/高端"时各自的局部角点号。
-        // 角点号约定 bit0=x, bit1=y, bit2=z(与 corner_pos 一致)。
+        // 一条网格棱的 4 个邻 cell,以及该棱在各自格内的**局部棱号**(轴固定):
+        // 局部棱号 = 4·轴 + 该轴上的位置(0..3),与端点谁负无关。
         for k in klo..khi {
             match axis {
                 0 => {
@@ -4724,16 +4738,12 @@ pub mod nets {
                             if (a < 0.0) == (b < 0.0) {
                                 continue;
                             }
-                            let lc: [u8; 4] = if a < 0.0 {
-                                [0, 2, 6, 4]
-                            } else {
-                                [1, 3, 7, 5]
-                            };
+                            let le: [usize; 4] = [0, 1, 3, 2];
                             let q = [
-                                vid(i, j, k, lc[0]),
-                                vid(i, j - 1, k, lc[1]),
-                                vid(i, j - 1, k - 1, lc[2]),
-                                vid(i, j, k - 1, lc[3]),
+                                vid(i, j, k, le[0]),
+                                vid(i, j - 1, k, le[1]),
+                                vid(i, j - 1, k - 1, le[2]),
+                                vid(i, j, k - 1, le[3]),
                             ];
                             if q.iter().any(|v| *v == u32::MAX) {
                                 continue;
@@ -4751,16 +4761,12 @@ pub mod nets {
                             if (a < 0.0) == (b < 0.0) {
                                 continue;
                             }
-                            let lc: [u8; 4] = if a < 0.0 {
-                                [0, 1, 5, 4]
-                            } else {
-                                [2, 3, 7, 6]
-                            };
+                            let le: [usize; 4] = [4, 5, 7, 6];
                             let q = [
-                                vid(i, j, k, lc[0]),
-                                vid(i - 1, j, k, lc[1]),
-                                vid(i - 1, j, k - 1, lc[2]),
-                                vid(i, j, k - 1, lc[3]),
+                                vid(i, j, k, le[0]),
+                                vid(i - 1, j, k, le[1]),
+                                vid(i - 1, j, k - 1, le[2]),
+                                vid(i, j, k - 1, le[3]),
                             ];
                             if q.iter().any(|v| *v == u32::MAX) {
                                 continue;
@@ -4778,16 +4784,12 @@ pub mod nets {
                             if (a < 0.0) == (b < 0.0) {
                                 continue;
                             }
-                            let lc: [u8; 4] = if a < 0.0 {
-                                [0, 1, 3, 2]
-                            } else {
-                                [4, 5, 7, 6]
-                            };
+                            let le: [usize; 4] = [8, 9, 11, 10];
                             let q = [
-                                vid(i, j, k, lc[0]),
-                                vid(i - 1, j, k, lc[1]),
-                                vid(i - 1, j - 1, k, lc[2]),
-                                vid(i, j - 1, k, lc[3]),
+                                vid(i, j, k, le[0]),
+                                vid(i - 1, j, k, le[1]),
+                                vid(i - 1, j - 1, k, le[2]),
+                                vid(i, j - 1, k, le[3]),
                             ];
                             if q.iter().any(|v| *v == u32::MAX) {
                                 continue;
@@ -4837,30 +4839,33 @@ pub mod nets {
             });
         }
 
-        // 2) 变号 cell 一个顶点 = 12 棱交叉点平均(经典 Surface Nets)
+        // 2) 变号 cell 每片表面一个顶点 = 该片 12 棱交叉点的 QEF 最小二乘
         //    按 ck 切 k 平面并行:每片产出**局部**顶点号写入本片 cell_vert,
         //    之后按片序合并(片内顶点先于后片)⟹ 与串行顶点编号逐位一致。
-        // **每格多顶点**:立方体 8 个角点里,"负角点的边连通分量"最多 4 个
-        // (独立集上界),故每格留 4 个顶点槽;cell_label 记录每个角点属于哪个分量。
-        // 这样两片表面挤进同一个格时各自拿到独立顶点,不会被焊成非流形边。
+        // **每格多顶点**:一片表面 = 该格 12 条交叉棱经**共享面**连通后的分量。
+        //    判据只看面(相邻两格对同一面的 4 个角点值完全相同,面内 4 交叉的鞍点
+        //    用同一个 decider 消歧)⟹ 分量归属跨格天然一致,quad 装配不会再
+        //    把两片表面错接到一起 —— P19 遗留破损/翻折襟翼的治本点。
+        //    立方体的分量数上界为 4(4 个互不相邻的负角各自成片),故每格 4 槽。
+        //    cell_pack:每条棱 4 bit,存"该棱所属分量落在第几个顶点槽"(0 = 无)。
         let mut cell_vert = vec![u32::MAX; n * n * n * 4];
-        let mut cell_label = vec![u8::MAX; n * n * n * 8];
+        let mut cell_pack = vec![0u64; n * n * n];
         let mut verts: Vec<[f32; 3]> = Vec::new();
         {
             let nslab = n;
             let mut slabs: Vec<&mut [u32]> = cell_vert.chunks_mut(n * n * 4).collect();
-            let mut labs: Vec<&mut [u8]> = cell_label.chunks_mut(n * n * 8).collect();
+            let mut packs: Vec<&mut [u64]> = cell_pack.chunks_mut(n * n).collect();
             debug_assert_eq!(slabs.len(), nslab);
             let locals: Vec<std::sync::Mutex<Vec<[f32; 3]>>> =
                 (0..nslab).map(|_| std::sync::Mutex::new(Vec::new())).collect();
-            let mut jobs: Vec<(usize, &mut [u32], &mut [u8])> = slabs
+            let mut jobs: Vec<(usize, &mut [u32], &mut [u64])> = slabs
                 .drain(..)
-                .zip(labs.drain(..))
+                .zip(packs.drain(..))
                 .enumerate()
                 .map(|(s, (a, b))| (s, a, b))
                 .collect();
             let nt = nthreads().min(nslab).max(1);
-            let mut per: Vec<Vec<(usize, &mut [u32], &mut [u8])>> =
+            let mut per: Vec<Vec<(usize, &mut [u32], &mut [u64])>> =
                 (0..nt).map(|_| Vec::new()).collect();
             for (s, job) in jobs.drain(..).enumerate() {
                 per[s % nt].push(job);
@@ -4871,7 +4876,20 @@ pub mod nets {
                 for mine in per.into_iter() {
                     let locals = &locals;
                     sc.spawn(move || {
-                        for (ck, slab, lab_slab) in mine {
+                        fn uf_find(p: &mut [u8; 12], mut x: u8) -> u8 {
+                            while p[x as usize] != x {
+                                p[x as usize] = p[p[x as usize] as usize];
+                                x = p[x as usize];
+                            }
+                            x
+                        }
+                        fn uf_union(p: &mut [u8; 12], a: u8, b: u8) {
+                            let (ra, rb) = (uf_find(p, a), uf_find(p, b));
+                            if ra != rb {
+                                p[rb as usize] = ra;
+                            }
+                        }
+                        for (ck, slab, pk_slab) in mine {
                             let mut out: Vec<[f32; 3]> = Vec::new();
                             for cj in 0..n {
                                 for ci in 0..n {
@@ -4887,44 +4905,83 @@ pub mod nets {
                                     if !(any_neg && any_pos) {
                                         continue;
                                     }
-                                    // 负角点的**边连通分量**(立方体 12 棱) —— 一个分量 = 一片表面
-                                    let mut par = [0u8; 8];
-                                    for i in 0..8 {
-                                        par[i] = i as u8;
+                                    // 12 棱交叉位
+                                    let mut xr = [false; 12];
+                                    for (ei, &(a, b)) in EDGES.iter().enumerate() {
+                                        xr[ei] = (cv[a] < 0.0) != (cv[b] < 0.0);
                                     }
-                                    for (a, b) in EDGES {
-                                        if cv[a] < 0.0 && cv[b] < 0.0 {
-                                            let mut ra = a as u8;
-                                            while par[ra as usize] != ra {
-                                                par[ra as usize] = par[par[ra as usize] as usize];
-                                                ra = par[ra as usize];
+                                    // 交叉棱经 6 个面连通:面内 2 交叉直接连;4 交叉
+                                    // (鞍点)按面心符号消歧 —— 中心为负 ⟹ 负区连成一体
+                                    // ⟹ 正角是两个孤岛,交叉绕孤岛成对相连。
+                                    let mut ep = [0u8; 12];
+                                    for i in 0..12 {
+                                        ep[i] = i as u8;
+                                    }
+                                    for (fc, fe) in FACES {
+                                        let mut cr = [false; 4];
+                                        let mut m = 0;
+                                        for i in 0..4 {
+                                            cr[i] = xr[fe[i]];
+                                            if cr[i] {
+                                                m += 1;
                                             }
-                                            let mut rb = b as u8;
-                                            while par[rb as usize] != rb {
-                                                par[rb as usize] = par[par[rb as usize] as usize];
-                                                rb = par[rb as usize];
+                                        }
+                                        if m == 2 {
+                                            // 两个交叉可能相邻(面上只有一个角异号)或对位
+                                            // (两个角相邻同号)——都存在一条面内弧把两者连起来。
+                                            let mut ix = [0usize; 2];
+                                            let mut k2 = 0;
+                                            for (i, &c) in cr.iter().enumerate() {
+                                                if c {
+                                                    ix[k2] = fe[i];
+                                                    k2 += 1;
+                                                }
                                             }
-                                            if ra != rb {
-                                                par[rb as usize] = ra;
+                                            uf_union(&mut ep, ix[0] as u8, ix[1] as u8);
+                                        } else if m == 4 {
+                                            // 面内鞍点消歧:用**渐近 decider**(Nielson–Hamann)
+                                            // 而不是 4 角均值 —— 双线性曲面的鞍点值为
+                                            //   s = (v0·v2 − v1·v3) / (v0+v2−v1−v3)
+                                            // 薄壁面上 4 角值几乎相等,均值会把符号判反。
+                                            // 退化(分母≈0)时才退回均值。
+                                            let (v0, v1, v2, v3) = (
+                                                cv[fc[0]] as f64,
+                                                cv[fc[1]] as f64,
+                                                cv[fc[2]] as f64,
+                                                cv[fc[3]] as f64,
+                                            );
+                                            let den = v0 + v2 - v1 - v3;
+                                            let sv = if den.abs() > 1e-12 {
+                                                (v0 * v2 - v1 * v3) / den
+                                            } else {
+                                                0.25 * (v0 + v1 + v2 + v3)
+                                            };
+                                            let island_neg = sv >= 0.0;
+                                            if (cv[fc[0]] < 0.0) == island_neg {
+                                                // 孤岛是角 0/2 → 绕它们的交叉对为 (e3,e0)、(e1,e2)
+                                                uf_union(&mut ep, fe[3] as u8, fe[0] as u8);
+                                                uf_union(&mut ep, fe[1] as u8, fe[2] as u8);
+                                            } else {
+                                                // 孤岛是角 1/3 → (e0,e1)、(e2,e3)
+                                                uf_union(&mut ep, fe[0] as u8, fe[1] as u8);
+                                                uf_union(&mut ep, fe[2] as u8, fe[3] as u8);
                                             }
                                         }
                                     }
-                                    let mut root_id = [u8::MAX; 8];
-                                    let mut lab = [u8::MAX; 8];
+                                    // 分量号按"根首次出现"编号(确定性,与线程调度无关)
+                                    let mut rid = [u8::MAX; 12];
+                                    let mut pid = [u8::MAX; 12];
                                     let mut ncomp = 0u8;
-                                    for i in 0..8 {
-                                        if cv[i] >= 0.0 {
+                                    for e in 0..12 {
+                                        if !xr[e] {
                                             continue;
                                         }
-                                        let mut r = i as u8;
-                                        while par[r as usize] != r {
-                                            r = par[r as usize];
-                                        }
-                                        if root_id[r as usize] == u8::MAX {
-                                            root_id[r as usize] = ncomp;
+                                        let r = uf_find(&mut ep, e as u8) as usize;
+                                        if rid[r] == u8::MAX {
+                                            rid[r] = ncomp;
                                             ncomp += 1;
                                         }
-                                        lab[i] = root_id[r as usize];
+                                        pid[e] = rid[r];
                                     }
                                     let o = [
                                         vmin[0] + ci as Real * step,
@@ -4934,18 +4991,21 @@ pub mod nets {
                                     let od = [o[0] as f64, o[1] as f64, o[2] as f64];
                                     let sd = step as f64;
                                     // 每个分量各自做一次 QEF,产出自己的顶点
+                                    let mut pk = 0u64;
+                                    let mut nslot = 0usize;
                                     for comp in 0..ncomp {
+                                        if nslot >= 4 {
+                                            break;
+                                        }
                                         let mut cp = [[0f64; 3]; 12];
                                         let mut cn = [[0f64; 3]; 12];
                                         let mut cnt = 0usize;
-                                        for (a, b) in EDGES {
+                                        for (ei, &(a, b)) in EDGES.iter().enumerate() {
                                             let (va, vb) = (cv[a] as f64, cv[b] as f64);
                                             if (va < 0.0) == (vb < 0.0) {
                                                 continue;
                                             }
-                                            // 交叉点归属"负端点所在的那一片"
-                                            let neg = if va < 0.0 { a } else { b };
-                                            if lab[neg] != comp {
+                                            if pid[ei] != comp {
                                                 continue;
                                             }
                                             let t = va / (va - vb);
@@ -5033,12 +5093,17 @@ pub mod nets {
                                                 break;
                                             }
                                         }
-                                        slab[(cj * n + ci) * 4 + comp as usize] = out.len() as u32;
+                                        let vidx = out.len() as u32;
+                                        for e in 0..12 {
+                                            if xr[e] && pid[e] == comp {
+                                                pk |= ((nslot + 1) as u64) << (4 * e);
+                                            }
+                                        }
+                                        slab[(cj * n + ci) * 4 + nslot] = vidx;
                                         out.push([pos[0] as f32, pos[1] as f32, pos[2] as f32]);
+                                        nslot += 1;
                                     }
-                                    for c in 0..8 {
-                                        lab_slab[(cj * n + ci) * 8 + c] = lab[c];
-                                    }
+                                    pk_slab[cj * n + ci] = pk;
                                 }
                             }
                             *locals[ck].lock().unwrap() = out;
@@ -5079,7 +5144,7 @@ pub mod nets {
                     let locals = &locals;
                     let vals = &vals;
                     let cell_vert = &cell_vert;
-                    let cell_label = &cell_label;
+                    let cell_pack = &cell_pack;
                     let verts = &verts;
                     sc.spawn(move || {
                         let mut s = w;
@@ -5093,7 +5158,7 @@ pub mod nets {
                                 dim,
                                 vals,
                                 cell_vert,
-                                cell_label,
+                                cell_pack,
                                 verts,
                                 &mut out,
                             );

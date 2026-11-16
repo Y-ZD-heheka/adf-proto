@@ -19,3 +19,6 @@ roundtrip.stl
 stl_out*.stl
 out_*.stl
 roundtrip.stl
+
+# 分阶段/对照用的临时 STL
+stl_*.stl
