@@ -2506,6 +2506,72 @@ pub mod nets {
         /// 参数:`iters` 次 Taubin(λ=0.5, μ=−0.53,交替做**不收缩**的平滑),
         /// 位移上限 `max_disp`(按顶点原始位置钳住,避免薄壁被抹平)。
         /// 返回(平均位移, 最大位移)mm。
+        /// 把每个顶点沿场梯度 Newton 投影回零等值面(**不做**平滑)。
+        ///
+        /// 为什么简化后必须做:QEM 的代价是"到切平面距离²",在**凸曲面**上
+        /// 最优点落在曲面**内侧**(弦高)。合并跨度 2–4° 时 40mm 半径的圆柱缘
+        /// 就内缩 0.02–0.2mm,表现为圆缘变成多段内凹折线(查看器逐段画缘线
+        /// = 满屏锯齿)。投影按场真值把顶点拉回零面,弦高归零;对平面区幂等。
+        ///
+        /// `max_step`:单步位移上限(建议 1 个重采样格,防薄壁顶点跨到另一侧)。
+        /// 返回 (首轮平均位移 mm, 首轮最大位移 mm)。
+        pub fn project_to_zero(&mut self, adf: &Adf, iters: usize, max_step: f64) -> (f64, f64) {
+            let n = self.verts.len();
+            if n == 0 || iters == 0 {
+                return (0.0, 0.0);
+            }
+            let mut p: Vec<[f64; 3]> = self
+                .verts
+                .iter()
+                .map(|v| [v[0] as f64, v[1] as f64, v[2] as f64])
+                .collect();
+            let hstep = 1e-3 * adf.size;
+            let lim = if max_step.is_finite() && max_step > 0.0 { max_step } else { 1.0 };
+            let (mut sum, mut cnt, mut maxd) = (0.0f64, 0usize, 0.0f64);
+            for it in 0..iters {
+                for i in 0..n {
+                    let q = p[i];
+                    let d0 = adf.eval(q) as f64;
+                    if !d0.is_finite() || d0.abs() > 8.0 * lim {
+                        continue;
+                    }
+                    let mut g = [0.0f64; 3];
+                    for k in 0..3 {
+                        let mut qq = q;
+                        qq[k] += hstep;
+                        g[k] = (adf.eval(qq) as f64 - d0) / hstep;
+                    }
+                    let g2 = g[0] * g[0] + g[1] * g[1] + g[2] * g[2];
+                    if g2 < 0.25 {
+                        continue; // 场的奇异处,投影会把点甩远
+                    }
+                    let mut step = [0.0f64; 3];
+                    for k in 0..3 {
+                        step[k] = -d0 * g[k] / g2;
+                    }
+                    let sl = (step[0] * step[0] + step[1] * step[1] + step[2] * step[2]).sqrt();
+                    if sl > lim {
+                        let f = lim / sl;
+                        for k in 0..3 {
+                            step[k] *= f;
+                        }
+                    }
+                    for k in 0..3 {
+                        p[i][k] = q[k] + step[k];
+                    }
+                    if it == 0 {
+                        sum += sl;
+                        cnt += 1;
+                        maxd = maxd.max(sl);
+                    }
+                }
+            }
+            for (v, q) in self.verts.iter_mut().zip(p.iter()) {
+                *v = [q[0] as f32, q[1] as f32, q[2] as f32];
+            }
+            (sum / cnt.max(1) as f64, maxd)
+        }
+
         pub fn smooth_and_project(&mut self, adf: &Adf, iters: usize, max_disp: f32) -> (f64, f64) {
             let n = self.verts.len();
             if n == 0 || self.tris.is_empty() {
@@ -3669,6 +3735,14 @@ pub mod nets {
         /// `feature_deg`: 特征边二面角阈值;`target_tris`: 0 = 纯误差驱动。
         /// 返回(塌缩次数, 简化后三角数)。
         pub fn decimate(&mut self, err2_max: f64, feature_deg: f64, target_tris: usize) -> usize {
+            // 脊线(二面角>25°)的合并上限:**与 err2 解耦**。阶梯合并代价由
+            // 采样步长决定(~2.5e-3 mm² @ h≈0.1),把它绑在 err2 上意味着
+            // "用户收紧弦差预算"会顺带让直角缘阶梯退不回去(实测 50×2.5e-5
+            // = 1.25e-3 < 阶梯代价 → 满屏短黑线/翻折片)。默认取二者较大者。
+            let ridge_thr: f64 = std::env::var("ADF_RIDGE_ERR2")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or((err2_max * 50.0).max(4.0e-3));
             let n_t0 = self.tris.len();
             let nv = self.verts.len();
             // ── 1) 面平面 + 顶点二次型 ──
@@ -3908,7 +3982,7 @@ pub mod nets {
                 // 全局 pop 上限 = 50×err2(锐边放宽档);普通边在下方按自身
                 // 阈值过滤。锯齿阶梯合并代价 = 垂直抖动²(~2.5e-3)≫err2,
                 // 不放宽则阶梯永不合并 → 满屏短黑线(实测均匀网格 5.7 万条)。
-                if cost > err2_max * 50.0 {
+                if cost > ridge_thr {
                     break;
                 }
                 if banned.contains(&(if a < b {
@@ -3971,7 +4045,7 @@ pub mod nets {
                     let n1 = tn(shared[1]);
                     let d = n0[0] * n1[0] + n0[1] * n1[1] + n0[2] * n1[2];
                     if d < (-25.0f64).to_radians().cos() {
-                        err2_max * 50.0
+                        ridge_thr
                     } else {
                         err2_max
                     }

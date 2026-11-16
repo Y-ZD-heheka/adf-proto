@@ -118,6 +118,12 @@ fn main() {
             mesh.tris.len(),
             mesh.tris.len() * 50 / 1024 / 1024
         );
+        // 简化把凸曲面顶点按弦高内缩(QEM 最优在曲面内侧),圆缘会变成
+        // 多段内凹折线。投影回零面把弦高归零(平面区幂等)。
+        if std::env::var("ADF_NO_PROJ").is_err() {
+            let (pm, px) = mesh.project_to_zero(&adf, 3, h_ext as f64);
+            println!("[project] 首轮位移 mean {pm:.4} max {px:.4} mm");
+        }
         // 脊线重吸附:decimate 对锐边放宽阈值合并锯齿阶梯(否则满屏短黑线),
         // 合并点残余偏移由强吸附拉回原始缘线 → 脊线成长段光滑折线。
         // 吸附参数可调:lim 必须够大才能把 decimate 挤出去的脊线顶点拉回
