@@ -120,9 +120,19 @@ fn main() {
         );
         // 脊线重吸附:decimate 对锐边放宽阈值合并锯齿阶梯(否则满屏短黑线),
         // 合并点残余偏移由强吸附拉回原始缘线 → 脊线成长段光滑折线。
+        // 吸附参数可调:lim 必须够大才能把 decimate 挤出去的脊线顶点拉回
+        // (0.5mm 对 40mm 半径的圆缘偏小,残余台阶 ~1mm 会留成"牙齿")
+        let snap_lim: f64 = std::env::var("ADF_SNAP_LIM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.5);
+        let snap_str: f64 = std::env::var("ADF_SNAP_STR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.95);
         if std::env::var("ADF_NO_SNAP2").is_err() {
             let t5 = Instant::now();
-            let ns = mesh.snap_sharp_to_rim(&adf, 0.5, 0.95);
+            let ns = mesh.snap_sharp_to_rim(&adf, snap_lim, snap_str);
             // 吸附把锐边顶点拉回缘线,邻接窄带三角被挤扁 → 清理针状薄片
             let nsl = mesh.collapse_slivers_ex(0.02, 6, 0.08, 0.3);
             println!("[snap2] {:?} | 重吸附 {ns} 锐边顶点,清薄片 {nsl}", t5.elapsed());
@@ -133,7 +143,7 @@ fn main() {
                 let t6 = Instant::now();
                 let (nc2, nr2) = mesh.repair_folds(&adf, 0.5, 0.004, 0.002, h_ext as f64 * 4.0, 10);
                 let nsl2 = mesh.collapse_slivers_ex(0.02, 6, 0.08, 0.3);
-                let ns2 = mesh.snap_sharp_to_rim(&adf, 0.5, 0.95);
+                let ns2 = mesh.snap_sharp_to_rim(&adf, snap_lim, snap_str);
                 println!(
                     "[repair2] {:?} | 折叠塌缩 {nc2},删面 {nr2},清薄片 {nsl2},重吸附 {ns2}",
                     t6.elapsed()
