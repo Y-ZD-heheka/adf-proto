@@ -6,9 +6,12 @@
 ## 构建 / 测试 / 演示
 
 ```bash
-cargo test --release          # 24/24
+cargo test --release
 cargo run --release --bin stl-demo                                    # 桌腿固定器
 cargo run --release --bin stl-demo -- stls/Turbo_Impeller.stl 0.2     # 涡轮叶轮压测
+
+# 无切削重建：输入文件、目标格宽、输出文件、提取倍率
+cargo run --release --bin stl_roundtrip -- stls/Turbo_Impeller.stl 0.2 out.stl 2
 
 # 性能定位工具
 cargo run --release --example bench_bvh      # 最近点查询:深度/种子/线程扩展性

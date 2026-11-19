@@ -4,9 +4,9 @@
 //! 与 `stl-demo` 的区别:后者会为演示切削能力打两个胶囊孔,本工具**只重建**。
 //!
 //! 用法:
-//!   cargo run --release --bin stl-roundtrip -- <输入.stl> [h_target] [输出.stl] [提取倍率]
+//!   cargo run --release --bin stl_roundtrip -- <输入.stl> [h_target] [输出.stl] [提取倍率]
 //! 例:
-//!   cargo run --release --bin stl-roundtrip -- stls/Turbo_Impeller.stl 0.2 out.stl 2
+//!   cargo run --release --bin stl_roundtrip -- stls/Turbo_Impeller.stl 0.2 out.stl 2
 
 use adf_proto::*;
 use std::time::Instant;
@@ -155,6 +155,13 @@ fn main() {
                     t6.elapsed()
                 );
             }
+        }
+        if std::env::var("ADF_NO_PROJ").is_err()
+            && let BaseField::Mesh(reference) = &adf.field.base
+        {
+            let t = Instant::now();
+            mesh.project_to_reference(reference, h_ext * 0.5);
+            println!("[reference] 原始表面投影 {:?}", t.elapsed());
         }
     }
     let (open, nonman, comps) = mesh.edge_stats();

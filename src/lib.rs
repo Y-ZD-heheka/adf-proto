@@ -1878,20 +1878,22 @@ impl Adf {
     /// 自适应求值:下降到包含 p 的叶,角点三线性插值。
     /// 已知限制:跨分辨率边界处插值基不一致,存在 T-junction 误差(spike 要测的就是它)。
     pub fn eval(&self, p: [Real; 3]) -> f32 {
+        let (corners, u, _) = self.leaf_coordinates(p);
+        trilinear(u, corners)
+    }
+
+    /// 取求值所在叶、局部坐标及格宽。值和解析梯度使用同一组角点。
+    #[inline]
+    fn leaf_coordinates(&self, p: [Real; 3]) -> (&[f32; 8], [Real; 3], Real) {
         let q = self.clamp_to_domain(p);
         let mut o = self.min;
         let mut s = self.size;
         let mut idx = self.root;
         loop {
-            match self.nodes[idx as usize] {
+            match &self.nodes[idx as usize] {
                 Node::Leaf(c) => {
-                    // 远场粗叶的插值误差**不能**靠"改读烘焙网格"解决(P6 已否决):
-                    // 实测叶轮 77% 体积由 d4 叶覆盖(阈值内),改用网格三线性后
-                    // [error] 仅 8.77 → 8.88mm;把网格提到 257³ 也只到 8.42mm,
-                    // 而 bake 涨 4×。说明误差源是**网格自身的符号**(薄壁件上 EDT 的
-                    // 最近站符号会取反,max ≈ 2×距离),不是插值或分辨率。见 P5。
                     let u = [(q[0] - o[0]) / s, (q[1] - o[1]) / s, (q[2] - o[2]) / s];
-                    return trilinear(u, &c);
+                    return (c, u, s);
                 }
                 Node::Internal(ch) => {
                     let i = child_index(q, o, s);
@@ -2525,22 +2527,17 @@ pub mod nets {
                 .iter()
                 .map(|v| [v[0] as f64, v[1] as f64, v[2] as f64])
                 .collect();
-            let hstep = 1e-3 * adf.size;
             let lim = if max_step.is_finite() && max_step > 0.0 { max_step } else { 1.0 };
             let (mut sum, mut cnt, mut maxd) = (0.0f64, 0usize, 0.0f64);
             for it in 0..iters {
                 for i in 0..n {
                     let q = p[i];
-                    let d0 = adf.eval(q) as f64;
+                    let (corners, u, width) = adf.leaf_coordinates(q);
+                    let d0 = trilinear(u, corners) as f64;
                     if !d0.is_finite() || d0.abs() > 8.0 * lim {
                         continue;
                     }
-                    let mut g = [0.0f64; 3];
-                    for k in 0..3 {
-                        let mut qq = q;
-                        qq[k] += hstep;
-                        g[k] = (adf.eval(qq) as f64 - d0) / hstep;
-                    }
+                    let g = tri_grad(corners, u, 1.0 / width);
                     let g2 = g[0] * g[0] + g[1] * g[1] + g[2] * g[2];
                     if g2 < 0.25 {
                         continue; // 场的奇异处,投影会把点甩远
@@ -2570,6 +2567,67 @@ pub mod nets {
                 *v = [q[0] as f32, q[1] as f32, q[2] as f32];
             }
             (sum / cnt.max(1) as f64, maxd)
+        }
+
+        /// 无切削 STL 重建的末次投影。每点沿最近面方向移动至多 max_step，
+        /// 串行验收移动以计入已移动的邻点，保留邻面原方向上的至少 1/4 面积。
+        /// 仅走到投影距离的 90%，避免临近锐边的多个顶点重合。
+        pub fn project_to_reference(&mut self, reference: &meshfield::MeshField, max_step: f64) {
+            if self.verts.is_empty() || !max_step.is_finite() || max_step <= 0.0 {
+                return;
+            }
+            let mut incident = vec![Vec::new(); self.verts.len()];
+            let mut initial_normals = Vec::with_capacity(self.tris.len());
+            for (index, &[a, b, c]) in self.tris.iter().enumerate() {
+                let p = g64(self.verts[a as usize]);
+                let ab = sub(g64(self.verts[b as usize]), p);
+                let ac = sub(g64(self.verts[c as usize]), p);
+                initial_normals.push(cross3(ab, ac));
+                let face = index as u32;
+                incident[a as usize].push((b, c, face));
+                incident[b as usize].push((c, a, face));
+                incident[c as usize].push((a, b, face));
+            }
+            let mut targets = self.verts.clone();
+            let batch = targets.len().div_ceil(nthreads());
+            std::thread::scope(|scope| {
+                for chunk in targets.chunks_mut(batch) {
+                    scope.spawn(move || {
+                        for v in chunk {
+                            let p = g64(*v);
+                            let (distance, _, _, closest) = reference.closest_features(p);
+                            if distance > 0.0 {
+                                let fraction = (max_step / distance).min(0.9);
+                                *v = add(p, scale(sub(closest, p), fraction)).map(|x| x as f32);
+                            }
+                        }
+                    });
+                }
+            });
+            for (i, target) in targets.into_iter().enumerate() {
+                let original = self.verts[i];
+                if original == target {
+                    continue;
+                }
+                let old = g64(original);
+                let mut next = g64(target);
+                for _ in 0..5 {
+                    let valid = incident[i].iter().all(|&(b, c, face)| {
+                        let b = g64(self.verts[b as usize]);
+                        let c = g64(self.verts[c as usize]);
+                        let before = cross3(sub(b, old), sub(c, old));
+                        let after = cross3(sub(b, next), sub(c, next));
+                        let initial = initial_normals[face as usize];
+                        dot3(before, after) > 0.25 * dot3(before, before)
+                            && dot3(initial, after) > 0.25 * dot3(initial, initial)
+                    });
+                    if valid {
+                        self.verts[i] = next.map(|x| x as f32);
+                        break;
+                    }
+                    next = scale(add(old, next), 0.5).map(|x| x as f32 as f64);
+                }
+            }
         }
 
         pub fn smooth_and_project(&mut self, adf: &Adf, iters: usize, max_disp: f32) -> (f64, f64) {
@@ -2818,22 +2876,17 @@ pub mod nets {
             }
             // Newton 投影回零等值面:8 步(锐边处平滑会把顶点拉离表面 >1mm,
             // 2 步+限幅收不完;对已收敛顶点幂等,多迭代无副作用)
-            let hstep = 1e-3 * adf.size;
             for _ in 0..8 {
                 for i in 0..n {
                     let q = [p[i][0], p[i][1], p[i][2]];
-                    let d0 = adf.eval(q) as f64;
+                    let (corners, u, width) = adf.leaf_coordinates(q);
+                    let d0 = trilinear(u, corners) as f64;
                     // 只挡真正飞掉的点(碎屑已在投影前清理);阈值太紧会把
                     // 锐边处合法的 1mm 级顶点挡在投影门外(实测卡在 1.25mm)
                     if d0.abs() > 8.0 * max_disp as f64 {
                         continue; // 离面太远,不投影
                     }
-                    let mut g = [0.0f64; 3];
-                    for k in 0..3 {
-                        let mut qq = q;
-                        qq[k] += hstep;
-                        g[k] = (adf.eval(qq) as f64 - d0) / hstep;
-                    }
+                    let g = tri_grad(corners, u, 1.0 / width);
                     let g2 = g[0] * g[0] + g[1] * g[1] + g[2] * g[2];
                     // |∇d| 应≈1;远小于 1 说明落在场的奇异处,投影会把点甩得很远
                     if g2 < 0.25 {
@@ -4797,7 +4850,7 @@ pub mod nets {
             if s == 0 {
                 u32::MAX
             } else {
-                cell_vert[c * 4 + (s - 1) as usize]
+                cell_vert[c] + (s as u32 - 1)
             }
         };
         // 一条网格棱的 4 个邻 cell,以及该棱在各自格内的**局部棱号**(轴固定):
@@ -4882,6 +4935,7 @@ pub mod nets {
         let n = ((adf.size / h).round() as usize).max(1);
         let dim = n + 1;
         let step = adf.size / n as Real;
+        let edge_splits = (1usize << adf.max_depth).div_ceil(n).next_power_of_two().ilog2();
 
         // 1) 角点均匀重采样(走 ADF eval——自适应结构在这里兑现价值)
         //    逐点纯函数、与访问顺序无关 → 按 k 平面切带并行,结果逐位可复现。
@@ -4920,14 +4974,14 @@ pub mod nets {
         //    判据只看面(相邻两格对同一面的 4 个角点值完全相同,面内 4 交叉的鞍点
         //    用同一个 decider 消歧)⟹ 分量归属跨格天然一致,quad 装配不会再
         //    把两片表面错接到一起 —— P19 遗留破损/翻折襟翼的治本点。
-        //    立方体的分量数上界为 4(4 个互不相邻的负角各自成片),故每格 4 槽。
+        //    每格至多 4 个分量。它们在顶点数组中连续，每格只存首个索引。
         //    cell_pack:每条棱 4 bit,存"该棱所属分量落在第几个顶点槽"(0 = 无)。
-        let mut cell_vert = vec![u32::MAX; n * n * n * 4];
+        let mut cell_vert = vec![u32::MAX; n * n * n];
         let mut cell_pack = vec![0u64; n * n * n];
         let mut verts: Vec<[f32; 3]> = Vec::new();
         {
             let nslab = n;
-            let mut slabs: Vec<&mut [u32]> = cell_vert.chunks_mut(n * n * 4).collect();
+            let mut slabs: Vec<&mut [u32]> = cell_vert.chunks_mut(n * n).collect();
             let mut packs: Vec<&mut [u64]> = cell_pack.chunks_mut(n * n).collect();
             debug_assert_eq!(slabs.len(), nslab);
             let locals: Vec<std::sync::Mutex<Vec<[f32; 3]>>> =
@@ -5082,26 +5136,41 @@ pub mod nets {
                                             if pid[ei] != comp {
                                                 continue;
                                             }
-                                            let t = va / (va - vb);
                                             let pa = corner_pos(o, step, a);
                                             let pb = corner_pos(o, step, b);
-                                            let pt = [
-                                                pa[0] as f64 + (pb[0] - pa[0]) as f64 * t,
-                                                pa[1] as f64 + (pb[1] - pa[1]) as f64 * t,
-                                                pa[2] as f64 + (pb[2] - pa[2]) as f64 * t,
-                                            ];
-                                            let u = [
-                                                (pt[0] - od[0]) / sd,
-                                                (pt[1] - od[1]) / sd,
-                                                (pt[2] - od[2]) / sd,
-                                            ];
-                                            let g = tri_grad(&cv, u, 1.0 / sd);
-                                            let gl = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
-                                            if gl < 1e-9 {
-                                                continue;
+                                            let axis = ei / 4;
+                                            let mut lo = pa;
+                                            let mut hi = pb;
+                                            let (mut vlo, mut vhi) = (va, vb);
+                                            // 粗棱可跨越薄壁的中轴，两端距离间不再线性。
+                                            // 先按细叶尺度缩短变号区间，再用该叶的梯度拟合切平面。
+                                            for _ in 0..edge_splits {
+                                                let mut mid = lo;
+                                                mid[axis] = 0.5 * (lo[axis] + hi[axis]);
+                                                let vm = adf.eval(mid) as f64;
+                                                if (vm < 0.0) == (vlo < 0.0) {
+                                                    lo = mid;
+                                                    vlo = vm;
+                                                } else {
+                                                    hi = mid;
+                                                    vhi = vm;
+                                                }
                                             }
+                                            let mut pt = lo;
+                                            pt[axis] += (hi[axis] - lo[axis]) * vlo / (vlo - vhi);
+                                            let (corners, local, width) = adf.leaf_coordinates(pt);
+                                            let g = tri_grad(corners, local, 1.0 / width);
+                                            let gl = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
                                             cp[cnt] = pt;
-                                            cn[cnt] = [g[0] / gl, g[1] / gl, g[2] / gl];
+                                            cn[cnt] = if gl > 1e-9 {
+                                                [g[0] / gl, g[1] / gl, g[2] / gl]
+                                            } else {
+                                                // 异号已确定交叉。跨叶跳变时局部斜率可能为零，
+                                                // 用格边有向差分作退路，不能丢交叉或整片网格。
+                                                let mut direction = [0.0; 3];
+                                                direction[axis] = (vb - va).signum();
+                                                direction
+                                            };
                                             cnt += 1;
                                         }
                                         if cnt == 0 {
@@ -5173,7 +5242,9 @@ pub mod nets {
                                                 pk |= ((nslot + 1) as u64) << (4 * e);
                                             }
                                         }
-                                        slab[(cj * n + ci) * 4 + nslot] = vidx;
+                                        if nslot == 0 {
+                                            slab[cj * n + ci] = vidx;
+                                        }
                                         out.push([pos[0] as f32, pos[1] as f32, pos[2] as f32]);
                                         nslot += 1;
                                     }
@@ -5189,8 +5260,8 @@ pub mod nets {
             for s in 0..nslab {
                 let off = verts.len() as u32;
                 let mut loc = locals[s].lock().unwrap();
-                let base = s * n * n * 4;
-                for e in cell_vert[base..base + n * n * 4].iter_mut() {
+                let base = s * n * n;
+                for e in cell_vert[base..base + n * n].iter_mut() {
                     if *e != u32::MAX {
                         *e += off;
                     }
@@ -6722,6 +6793,79 @@ mod tests {
             got < 0.0 && (got - truth).abs() < 0.15,
             "y=2.9 被误钳(旧实现钳到 y=2.0 → 正值):got={got} truth={truth}"
         );
+    }
+
+    #[test]
+    fn coarse_extraction_resolves_two_faces_of_a_thin_plate() {
+        // 粗网格只有 z=0 一层位于板内，另一侧面控制该层的距离。
+        // 仅线性插值 z=0 与 0.5 的值会把上表面从 0.32 错置到 0.18。
+        let adf = Adf::build(
+            Stock::RoundBox { c: [0.0, 0.0, 0.11], half: [1.2, 1.2, 0.21], r: 0.0 },
+            [-2.0; 3], 4.0, 0.001, 0.2, 6,
+        );
+        let mesh = nets::extract_uniform(&adf, 0.5);
+        let interior: Vec<_> = mesh.verts.iter()
+            .filter(|v| v[0].abs() < 0.7 && v[1].abs() < 0.7).collect();
+        assert!(interior.iter().any(|v| v[2] > 0.0) && interior.iter().any(|v| v[2] < 0.0));
+        for v in interior {
+            let expected = if v[2] > 0.0 { 0.32 } else { -0.10 };
+            assert!((v[2] - expected).abs() < 0.01, "薄板面位置 {v:?}");
+        }
+        assert_eq!(mesh.edge_stats(), (0, 0, 1));
+    }
+
+    #[test]
+    fn flat_leaf_crossings_keep_the_surface_closed() {
+        let mut adf = Adf::build(
+            Stock::Sphere { c: [0.0; 3], r: 1.1 },
+            [-2.0; 3], 4.0, 0.001, 0.3, 5,
+        );
+        // 相邻叶分别为常量仍可在公共面处异号，局部叶内梯度不能决定连通性。
+        for node in &mut adf.nodes {
+            if let Node::Leaf(values) = node {
+                let center = trilinear([0.5; 3], values);
+                *values = [if center < 0.0 { -1.0 } else { 1.0 }; 8];
+            }
+        }
+        let m = nets::extract_uniform(&adf, 0.25);
+        assert!(!m.tris.is_empty(), "丢失了全部变号棱");
+        assert_eq!(m.edge_stats().0, 0, "平坦叶中的变号棱不能造成开口");
+    }
+
+    #[test]
+    fn reference_projection_limits_travel_and_preserves_incident_face_orientation() {
+        let reference = meshfield::MeshField::new(vec![[
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+        ]]);
+        let mut mesh = nets::Mesh {
+            verts: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.2, 0.4, 0.5]],
+            tris: vec![[0, 1, 2]],
+        };
+        mesh.project_to_reference(&reference, 0.1);
+        assert!((mesh.verts[2][2] - 0.4).abs() < 1e-6);
+        // 两个固定基点和一个只在 z 轴上错开的顶点，直投影会挤扁该三角。
+        mesh.verts[2] = [0.2, 0.0, 0.5];
+        mesh.project_to_reference(&reference, 1.0);
+        assert!(mesh.verts[2][2] > 0.125 && mesh.verts[2][2] < 0.5);
+    }
+
+    #[test]
+    fn adjacent_projection_steps_preserve_the_starting_face_normal() {
+        let reference = meshfield::MeshField::new(vec![[
+            [-9.0, -9.0, 0.0], [9.0, -9.0, 0.0], [0.0, 9.0, 0.0],
+        ]]);
+        let mut mesh = nets::Mesh {
+            verts: vec![[0.0, -0.51, -0.06], [-0.04, -0.10, 1.0], [0.02, -0.93, -1.09]],
+            tris: vec![[0, 1, 2]],
+        };
+        let normal = |v: &[[f32; 3]]| {
+            let ab = sub(v[1].map(f64::from), v[0].map(f64::from));
+            let ac = sub(v[2].map(f64::from), v[0].map(f64::from));
+            [ab[1]*ac[2]-ab[2]*ac[1], ab[2]*ac[0]-ab[0]*ac[2], ab[0]*ac[1]-ab[1]*ac[0]]
+        };
+        let before = normal(&mesh.verts);
+        mesh.project_to_reference(&reference, 0.35);
+        assert!(dot(before, normal(&mesh.verts)) >= 0.25 * dot(before, before));
     }
 
     #[test]
