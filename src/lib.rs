@@ -1231,9 +1231,9 @@ fn far_leaf(
     stats: &mut BuildStats,
 ) -> u32 {
     let mut corners = [0f32; 8];
-    // 开口或多重关联输入的射线符号不构成一致的内外场，不能由中心推断全叶。
+    // 开口网格可能无法一致定号，不能由中心推断全叶。
     let certified = match src {
-        ExactSrc::Base(BaseField::Mesh(mesh)) | ExactSrc::Seeded { base: BaseField::Mesh(mesh), .. } => mesh.has_paired_edges,
+        ExactSrc::Base(BaseField::Mesh(mesh)) | ExactSrc::Seeded { base: BaseField::Mesh(mesh), .. } => mesh.has_closed_surface(),
         _ => true,
     };
     for k in 0..8 {
@@ -4977,7 +4977,7 @@ pub mod nets {
     /// 对切削场或解析毛坯照常提取 ADF，避免把新加工面贴回毛坯。
     pub fn extract_mesh_roundtrip(adf: &Adf, h: Real) -> Mesh {
         let reference = match &adf.field.base {
-            BaseField::Mesh(mesh) if adf.field.cuts.is_empty() && mesh.has_paired_edges => Some(mesh),
+            BaseField::Mesh(mesh) if adf.field.cuts.is_empty() && mesh.has_closed_surface() => Some(mesh),
             _ => None,
         };
         extract_with_reference(adf, h, reference)
@@ -5689,6 +5689,31 @@ pub mod meshfield {
         [a[0] * k, a[1] * k, a[2] * k]
     }
 
+    fn vertex_key(v: [Real; 3]) -> [u64; 3] {
+        v.map(|x| if x == 0.0 { 0 } else { x.to_bits() })
+    }
+
+    // +X 射线。YZ 投影用半开边规则：公共对角线上的交点只由一面计数。
+    fn crosses_x(p: [Real; 3], t: &[[Real; 3]; 3]) -> bool {
+        let v = t.map(|q| sub3(q, p));
+        let edge = |a: [Real; 3], b: [Real; 3]| a[1] * b[2] - a[2] * b[1];
+        let w = [edge(v[1], v[2]), edge(v[2], v[0]), edge(v[0], v[1])];
+        let area = w[0] + w[1] + w[2];
+        if area == 0.0 { return false; }
+        for i in 0..3 {
+            if w[i] == 0.0 {
+                let a = v[(i + 1) % 3];
+                let b = v[(i + 2) % 3];
+                let upper = a[2] < b[2] || (a[2] == b[2] && a[1] > b[1]);
+                if upper != (area > 0.0) { return false; }
+            } else if (w[i] > 0.0) != (area > 0.0) {
+                return false;
+            }
+        }
+        let x = w[0] * v[0][0] + w[1] * v[1][0] + w[2] * v[2][0];
+        if area > 0.0 { x > 0.0 } else { x < 0.0 }
+    }
+
     /// 固定对角射线方向(非轴对齐 → 避开典型网格顶点/棱,奇偶可靠)。
     pub const PARITY_DIR: [Real; 3] = [0.408_248_3, 0.816_496_6, 0.408_248_3]; // normalize(1,2,1)
 
@@ -5720,6 +5745,7 @@ pub mod meshfield {
     /// 已知限制:非水密网格的符号在破洞附近不可靠(§9.2)。
     pub struct MeshField {
         pub(super) has_paired_edges: bool,
+        use_even_odd: bool,
         pub tris: Vec<[[Real; 3]; 3]>,
         bvh: Vec<Bvn>,
         order: Vec<u32>,
@@ -5841,15 +5867,23 @@ pub mod meshfield {
             let q = |v: Real| (v * 10000.0).round() as i64;
             let mut vid_map: std::collections::HashMap<[i64; 3], u32> = std::collections::HashMap::new();
             let mut tri_vid: Vec<[u32; 3]> = Vec::with_capacity(tris.len());
+            let mut representatives: Vec<[Real; 3]> = Vec::new();
+            let roundoff = (0..3).map(|a| aabb_max[a] - aabb_min[a]).fold(0.0, Real::max)
+                * (32.0 * Real::EPSILON);
+            let mut welded = false;
             let mut nv = 0u32;
             for t in &tris {
                 let mut ids = [0u32; 3];
                 for (k, v) in t.iter().enumerate() {
                     let key = [q(v[0]), q(v[1]), q(v[2])];
                     let id = match vid_map.get(&key) {
-                        Some(&i) => i,
+                        Some(&i) => {
+                            welded |= (0..3).any(|a| (v[a] - representatives[i as usize][a]).abs() > roundoff);
+                            i
+                        }
                         None => {
                             vid_map.insert(key, nv);
+                            representatives.push(*v);
                             nv += 1;
                             nv - 1
                         }
@@ -5903,8 +5937,26 @@ pub mod meshfield {
                     (k, [u[0] as f32, u[1] as f32, u[2] as f32])
                 })
                 .collect();
+            // 非流形或绕向混杂的闭合三角链仍有全局奇偶性。验证原坐标的边关联，
+            // 避免法线索引的合并容差跨过真实开缝。
+            let closed = has_paired_edges && !welded || face_n.iter().any(|n| *n != [0.0; 3]) && {
+                let mut odd = std::collections::HashSet::new();
+                for tri in &tris {
+                    let keys = tri.map(vertex_key);
+                    for i in 0..3 {
+                        let (a, b) = (keys[i], keys[(i + 1) % 3]);
+                        if a == b { continue; }
+                        let edge = (a.min(b), a.max(b));
+                        if !odd.remove(&edge) { odd.insert(edge); }
+                    }
+                }
+                odd.is_empty()
+            };
+            has_paired_edges &= closed;
+            let use_even_odd = closed && !has_paired_edges;
             MeshField {
                 has_paired_edges,
+                use_even_odd,
                 tris,
                 bvh,
                 order,
@@ -5922,6 +5974,83 @@ pub mod meshfield {
 
         pub fn triangle_count(&self) -> usize {
             self.tris.len()
+        }
+
+        pub fn has_closed_surface(&self) -> bool {
+            self.has_paired_edges || self.use_even_odd
+        }
+
+        /// 未切削重建中，独立实体若相互穿入或相距不足一个格宽，单一符号场
+        /// 会吞掉相邻表面。将它们分组后在同一原域提取。切削仍使用整体材料场。
+        pub fn into_roundtrip_layers(self, h: Real) -> Vec<Self> {
+            if !self.has_closed_surface() { return vec![self]; }
+            let mut parents: Vec<usize> = (0..self.tris.len()).collect();
+            fn root(parents: &mut [usize], mut i: usize) -> usize {
+                while parents[i] != i {
+                    parents[i] = parents[parents[i]];
+                    i = parents[i];
+                }
+                i
+            }
+            // 用原坐标连通，避免法线索引的量化误将近重合的独立壳焊在一起。
+            let mut vertices = std::collections::HashMap::new();
+            for (i, tri) in self.tris.iter().enumerate() {
+                for &v in tri {
+                    let other = *vertices.entry(vertex_key(v)).or_insert(i);
+                    let (a, b) = (root(&mut parents, i), root(&mut parents, other));
+                    parents[a] = b;
+                }
+            }
+            let mut ids = std::collections::HashMap::new();
+            let mut shells: Vec<Vec<usize>> = Vec::new();
+            for i in 0..parents.len() {
+                let key = root(&mut parents, i);
+                let id = *ids.entry(key).or_insert_with(|| {
+                    shells.push(Vec::new());
+                    shells.len() - 1
+                });
+                shells[id].push(i);
+            }
+            if shells.len() < 2 { return vec![self]; }
+
+            // 大壳先放；扩展两格让可能共用一格的表面分开。反向壳可能表示空腔，
+            // 必须与外壳共同定号。体积计算以壳上顶点为原点，避免远离原点时消减。
+            shells.sort_by_key(|s| std::cmp::Reverse(s.len()));
+            let mut boxes: Vec<Vec<([Real; 3], [Real; 3])>> = Vec::new();
+            let mut layers: Vec<Vec<usize>> = Vec::new();
+            for shell in shells {
+                let origin = self.tris[shell[0]][0];
+                let (mut lo, mut hi) = (origin, origin);
+                let mut volume6 = 0.0;
+                for &index in &shell {
+                    let t = &self.tris[index];
+                    volume6 += dot3(sub3(t[0], origin), cross3(sub3(t[1], origin), sub3(t[2], origin)));
+                    for v in t {
+                        for axis in 0..3 {
+                            lo[axis] = lo[axis].min(v[axis]);
+                            hi[axis] = hi[axis].max(v[axis]);
+                        }
+                    }
+                }
+                if volume6 <= 0.0 { return vec![self]; }
+                let separated = |(mn, mx): &([Real; 3], [Real; 3])| (0..3).any(|a|
+                    lo[a] > mx[a] + 2.0 * h || hi[a] < mn[a] - 2.0 * h
+                );
+                let layer = boxes.iter().position(|group| group.iter().all(separated)).unwrap_or(boxes.len());
+                if layer == boxes.len() {
+                    boxes.push(Vec::new());
+                    layers.push(Vec::new());
+                }
+                boxes[layer].push((lo, hi));
+                layers[layer].extend(shell);
+            }
+            if layers.len() < 2 { return vec![self]; }
+            let tris = self.tris;
+            layers.into_iter().map(|indices| {
+                let mut layer = Self::new(indices.into_iter().map(|i| tris[i]).collect());
+                layer.use_even_odd = layer.has_closed_surface();
+                layer
+            }).collect()
         }
 
         /// 参考平面只在其与有限格边的交点落在原三角内时才有效。
@@ -5978,6 +6107,9 @@ pub mod meshfield {
         /// 擦边 → 2134 个碎屑分量)。
         pub fn signed_from_feature(&self, p: [Real; 3], t: u32, feat: u8, cp: [Real; 3]) -> Real {
             let d = len(sub3(p, cp));
+            if self.use_even_odd {
+                return if self.inside_closed(p) { -d } else { d };
+            }
             let sgn = if feat == 6 {
                 let n: [Real; 3] = [
                     self.face_n[t as usize][0] as Real,
@@ -6129,6 +6261,31 @@ pub mod meshfield {
             self.signed_from_feature(p, t, feat, cp)
         }
 
+        // 闭合输入使用有限三角面交点的奇偶性。固定方向便于对共享棱执行
+        // 一致的半开规则，无需抖动采样位置或以多次射线投票。
+        fn inside_closed(&self, p: [Real; 3]) -> bool {
+            let mut odd = false;
+            let mut stack = [0u32; 64];
+            stack[0] = self.root;
+            let mut count = 1;
+            while count != 0 {
+                count -= 1;
+                let node = &self.bvh[stack[count] as usize];
+                if node.mx[0] <= p[0] || p[1] < node.mn[1] || p[1] > node.mx[1]
+                    || p[2] < node.mn[2] || p[2] > node.mx[2] { continue; }
+                if node.cnt == 0 {
+                    stack[count] = node.left;
+                    stack[count + 1] = node.right;
+                    count += 2;
+                } else {
+                    for &id in &self.order[node.start as usize..(node.start + node.cnt) as usize] {
+                        odd ^= crosses_x(p, &self.tris[id as usize]);
+                    }
+                }
+            }
+            odd
+        }
+
         /// 射线奇偶核心:给定方向的穿越计数(偶=外,奇=内)。要求水密网格。
         fn parity_hits(&self, p: [Real; 3], dir: [Real; 3]) -> u32 {
             let inv = [1.0 / dir[0], 1.0 / dir[1], 1.0 / dir[2]];
@@ -6178,6 +6335,7 @@ pub mod meshfield {
         /// 栈数组替代 per-call Vec 堆分配。现主要作伪法线符号的交叉验证与
         /// 水密性诊断;热路径符号已由 signed_distance_pn 承担。
         pub fn ray_parity_inside(&self, p: [Real; 3]) -> bool {
+            if self.use_even_odd { return self.inside_closed(p); }
             self.parity_hits(p, PARITY_DIR) % 2 == 1
         }
 
@@ -6423,6 +6581,60 @@ mod tests {
         let doubled = shell.repeat(2);
         assert!(!stlio::watertight_report(&doubled).1);
         assert!(!meshfield::MeshField::new(doubled).has_paired_edges);
+    }
+
+    #[test]
+    fn closed_shell_with_reversed_face_has_consistent_sign_on_both_sides() {
+        let p = [[0.,0.,0.], [1.,0.,0.], [0.,1.,0.], [0.,0.,1.]];
+        // The z=0 face has reversed winding, although every edge still has two uses.
+        let shell = [[0,1,2], [0,1,3], [0,3,2], [1,2,3]].map(|t| t.map(|id| p[id]));
+        let mesh = meshfield::MeshField::new(shell.to_vec());
+        assert!(mesh.signed_distance_pn([0.2, 0.2, -0.05]) > 0.0);
+        assert!(mesh.signed_distance_pn([0.2, 0.2, 0.05]) < 0.0);
+    }
+
+    #[test]
+    fn roundtrip_separates_close_solids_and_preserves_a_cavity() {
+        let p = [[0.,0.,0.], [1.,0.,0.], [0.,1.,0.], [0.,0.,1.]];
+        let outer = [[0,2,1], [0,1,3], [0,3,2], [1,2,3]].map(|t| t.map(|id| p[id]));
+        let inner = outer.map(|t| t.map(|v| v.map(|x| x * 0.2 + 0.1)));
+        let mut solids = outer.to_vec();
+        solids.extend(inner);
+        let layers = meshfield::MeshField::new(solids).into_roundtrip_layers(0.0625);
+        assert_eq!(layers.len(), 2);
+        // Both solids contain this lattice node; global parity would erase one surface.
+        assert!(layers.iter().all(|mesh| mesh.signed_distance_pn([0.125; 3]) < 0.0));
+
+        let mut hollow = outer.to_vec();
+        hollow.extend(inner.map(|[a,b,c]| [a,c,b]));
+        let layers = meshfield::MeshField::new(hollow).into_roundtrip_layers(0.0625);
+        assert_eq!(layers.len(), 1);
+        assert!(layers[0].signed_distance_pn([0.125; 3]) > 0.0);
+    }
+
+    #[test]
+    fn weld_tolerance_does_not_certify_an_open_crack() {
+        let p = [[0.,0.,0.], [1.,0.,0.], [0.,1.,0.], [0.,0.,1.]];
+        let mut shell = [[0,2,1], [0,1,3], [0,3,2], [1,2,3]].map(|t| t.map(|id| p[id]));
+        shell[0][0][2] += 1e-6;
+        assert!(stlio::watertight_report(&shell).1, "weld-only report");
+        assert!(!meshfield::MeshField::new(shell.to_vec()).has_closed_surface());
+    }
+
+    #[test]
+    fn parity_ray_through_face_diagonal_counts_one_crossing() {
+        let corners: [[Real; 3]; 8] = std::array::from_fn(|i|
+            [(i & 1) as Real, ((i >> 1) & 1) as Real, ((i >> 2) & 1) as Real]
+        );
+        let mut cube = Vec::new();
+        for [a,b,c,d] in [[0,4,6,2], [1,3,7,5], [0,1,5,4], [2,6,7,3], [0,2,3,1], [4,5,7,6]] {
+            cube.push([a,b,c].map(|i| corners[i]));
+            cube.push([a,c,d].map(|i| corners[i]));
+        }
+        cube[0].swap(1, 2);
+        let mesh = meshfield::MeshField::new(cube);
+        assert!(mesh.signed_distance_pn([0.5, 0.25, 0.25]) < 0.0);
+        assert!(mesh.signed_distance_pn([-0.5, 0.25, 0.25]) > 0.0);
     }
 
     fn small_adf() -> Adf {

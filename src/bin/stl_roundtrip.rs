@@ -51,6 +51,7 @@ fn main() {
 
     // ── 2) 网格场 + 域 ──
     let field = meshfield::MeshField::new(tm.tris);
+    let closed = field.has_closed_surface();
     let (amn, amx) = (field.aabb_min, field.aabb_max);
     let extent = (amx[0] - amn[0]).max((amx[1] - amn[1]).max(amx[2] - amn[2]));
     let margin = extent * 0.06 + 1.0;
@@ -60,6 +61,58 @@ fn main() {
     let h_min = size / (1u64 << max_depth) as Real;
     println!("[domain] 尺寸 {size:.2}mm | depth {max_depth} | h_min {h_min:.4}mm");
 
+    let h_ext = h_min * mult;
+    let t = Instant::now();
+    let layers = field.into_roundtrip_layers(h_ext);
+    let preserve_parts = closed && (!watertight || layers.len() > 1);
+    if layers.len() > 1 {
+        println!("[nets.layers] {} 组独立实体共用原域、格距和提取倍率", layers.len());
+    }
+    if !closed {
+        println!("[reference] 输入网格含未闭合边，使用距离场交点及后处理");
+    } else if !watertight {
+        println!("[reference] 闭合多重壳以穿越奇偶定号，采用原始三角面交点");
+    }
+    let mut parts = layers.into_iter().map(|field|
+        reconstruct_layer(field, min, size, max_depth, h_ext, closed, preserve_parts)
+    );
+    let mut mesh = parts.next().expect("至少一个网格场");
+    for part in parts {
+        let start = u32::try_from(mesh.verts.len()).expect("网格顶点数超过 u32 索引范围");
+        mesh.verts.extend(part.verts);
+        mesh.tris.extend(part.tris.into_iter().map(|t|
+            t.map(|i| i.checked_add(start).expect("网格顶点索引溢出"))
+        ));
+    }
+    let (open, nonman, comps) = mesh.edge_stats();
+    let vol = mesh.signed_volume().abs();
+    println!(
+        "[nets] h={h_ext:.4}({mult}×h_min) {:?} | 顶点 {} 三角 {}",
+        t.elapsed(),
+        mesh.verts.len(),
+        mesh.tris.len()
+    );
+    println!(
+        "[nets.topology] 开放边(洞) {open} | 非流形边 {nonman} | 连通分量 {comps}{}",
+        match (open, nonman) {
+            (0, 0) => " → 闭合流形(可打印)",
+            (0, _) => " → 闭合但含非流形边(切片软件一般可容错)",
+            _ => " → **有开口**",
+        }
+    );
+    println!(
+        "[volume] 重建 {vol:.1} vs 输入 {vol_in:.1} mm³({:+.2}%)",
+        (vol - vol_in) / vol_in * 100.0
+    );
+    let t = Instant::now();
+    nets::write_stl(&out, &mesh).expect("STL 写出失败");
+    println!("[stl] {out} 写出 {:?}", t.elapsed());
+}
+
+fn reconstruct_layer(
+    field: meshfield::MeshField, min: [Real; 3], size: Real, max_depth: u8, h_ext: Real,
+    closed: bool, preserve_parts: bool,
+) -> nets::Mesh {
     // ── 3) 建 ADF(不切削)──
     let t = Instant::now();
     let adf = Adf::build_with(
@@ -73,24 +126,18 @@ fn main() {
     let (nl, nb, _) = adf.leaf_stats_bytes();
     println!("[build] {:?} | 叶 {nl} | ≈{} KB", t.elapsed(), nb / 1024);
 
-    // ── 4) 提取 + 体检 + 导出 ──
-    let h_ext = h_min * mult;
-    let t = Instant::now();
+    // ── 4) 提取和后处理 ──
     let mut mesh = nets::extract_mesh_roundtrip(&adf, h_ext);
-    // 碎屑清理:丢掉 <50 三角、或体积 <0.01% 总体的孤立分量
-    // (场里的小符号岛,在查看器里表现为浮在表面附近的斑点)
-    let (nd, nt) = mesh.drop_small_components(50, 1e-4);
+    // 多壳 STL 中小的孤立分量也可能是源模型细节。单壳沿用已有碎屑清理。
+    let (nd, nt) = if preserve_parts { (0, 0) } else { mesh.drop_small_components(50, 1e-4) };
     if nt > 0 {
         println!("[clean] 丢弃碎屑分量 {nd} 个 / 三角 {nt}");
     }
     // 平滑 + 投影回零等值面:削掉叶边处的扇贝锯齿(位移上限 = 半格)
     // 参考三角面已提供几何约束。切削演示仍用距离场做平滑和吸附；
     // 在无切削模式中再次投向近似场会把已经恢复的棱角拉回粗场。
-    let field_post = !watertight || ["ADF_FIELD_POST", "ADF_REPAIR", "ADF_SNAP_LIM", "ADF_SNAP_STR"]
+    let field_post = !closed || ["ADF_FIELD_POST", "ADF_REPAIR", "ADF_SNAP_LIM", "ADF_SNAP_STR"]
         .iter().any(|key| std::env::var_os(key).is_some());
-    if !watertight {
-        println!("[reference] 输入边未成对反向关联，使用距离场交点及后处理");
-    }
     if field_post && std::env::var("ADF_NO_SMOOTH").is_err() {
         let t2 = Instant::now();
         let (dm, dx) = mesh.smooth_and_project(&adf, 3, h_ext as f32 * 0.5);
@@ -169,27 +216,5 @@ fn main() {
             println!("[reference] 原始表面投影 {:?}", t.elapsed());
         }
     }
-    let (open, nonman, comps) = mesh.edge_stats();
-    let vol = mesh.signed_volume().abs();
-    println!(
-        "[nets] h={h_ext:.4}({mult}×h_min) {:?} | 顶点 {} 三角 {}",
-        t.elapsed(),
-        mesh.verts.len(),
-        mesh.tris.len()
-    );
-    println!(
-        "[nets.topology] 开放边(洞) {open} | 非流形边 {nonman} | 连通分量 {comps}{}",
-        match (open, nonman) {
-            (0, 0) => " → 闭合流形(可打印)",
-            (0, _) => " → 闭合但含非流形边(切片软件一般可容错)",
-            _ => " → **有开口**",
-        }
-    );
-    println!(
-        "[volume] 重建 {vol:.1} vs 输入 {vol_in:.1} mm³({:+.2}%)",
-        (vol - vol_in) / vol_in * 100.0
-    );
-    let t = Instant::now();
-    nets::write_stl(&out, &mesh).expect("STL 写出失败");
-    println!("[stl] {out} 写出 {:?}", t.elapsed());
+    mesh
 }
