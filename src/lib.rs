@@ -1224,34 +1224,35 @@ fn far_leaf(
     src: &ExactSrc,
     grid: Option<&BakeGrid>,
     sign: Real,
+    band: Real,
     o: [Real; 3],
     s: Real,
     depth: u8,
     stats: &mut BuildStats,
 ) -> u32 {
     let mut corners = [0f32; 8];
+    // 开口或多重关联输入的射线符号不构成一致的内外场，不能由中心推断全叶。
+    let certified = match src {
+        ExactSrc::Base(BaseField::Mesh(mesh)) | ExactSrc::Seeded { base: BaseField::Mesh(mesh), .. } => mesh.has_paired_edges,
+        _ => true,
+    };
     for k in 0..8 {
         let p = corner_pos(o, s, k);
-        let mut v = match grid {
+        let v = match grid {
             Some(g) => g.sample_nearest(p) as f32,
             None => src.signed(p) as f32,
         };
         stats.sd_evals += 1;
-        if v.abs() < band_floor() {
-            v = sign as f32 * band_floor();
-        }
-        corners[k] = v;
+        corners[k] = if certified || v.abs() < band as f32 {
+            v.abs().max(band as f32).copysign(sign as f32)
+        } else {
+            v
+        };
     }
     stats.leaves += 1;
     stats.leaf_depth[depth as usize] += 1;
     nodes.push(Node::Leaf(corners));
     (nodes.len() - 1) as u32
-}
-
-/// 远叶角点幅值下限 = 壳层带宽(该叶不可能含 |d| ≤ band 的点)
-#[inline]
-fn band_floor() -> f32 {
-    0.5
 }
 
 /// 递归构建(refresh 路径,复合场闭包;保持旧行为逐位一致):
@@ -1340,7 +1341,7 @@ fn build_cell(
     let near = c_center.abs() <= band + half_diag + margin;
     if !near {
         // 远叶:表面已被 1-Lipschitz + 裕量排除;符号取网格中心值
-        return far_leaf(nodes, src, grid, c_center.signum() as Real, o, s, depth, stats);
+        return far_leaf(nodes, src, grid, c_center.signum(), band, o, s, depth, stats);
     }
     if lazy_sub && depth < max_depth {
         // 近大格:网格裕量可能误报(EDT 高估侧 ~2.7h)→ 精确中心复核(1 查)
@@ -1349,7 +1350,7 @@ fn build_cell(
             let c_ex = src.signed(ctr);
             stats.sd_evals += 1;
             if c_ex.abs() > band + half_diag {
-                return far_leaf(nodes, src, grid, c_ex.signum(), o, s, depth, stats);
+                return far_leaf(nodes, src, grid, c_ex.signum(), band, o, s, depth, stats);
             }
         }
         // 必细分,角点由子格承担(免采样)
@@ -1381,7 +1382,7 @@ fn build_cell(
         let c_ex = src.signed(ctr);
         stats.sd_evals += 1;
         if c_ex.abs() > band + half_diag {
-            return far_leaf(nodes, src, grid, c_ex.signum(), o, s, depth, stats);
+            return far_leaf(nodes, src, grid, c_ex.signum(), band, o, s, depth, stats);
         }
     }
     let mut cached_sd = cache.map(|c| move |p: [Real; 3]| -> Real { c.lookup_signed(p, src) });
@@ -4153,13 +4154,14 @@ pub mod nets {
                     continue;
                 }
                 // 最优位置
-                let (cost2, pos) = edge_cost(
+                let (_, pos) = edge_cost(
                     &q[a as usize],
                     &q[b as usize],
                     self.verts[a as usize],
                     self.verts[b as usize],
                 );
-                let _ = cost2;
+                // 两端都移动到同一 f32 导出坐标。用该坐标验证两端的存留面。
+                let pos = pos.map(|v| v as f32 as f64);
                 // 翻转检查 + 纵横比守卫:环绕三角(含 b→pos 代换)新法线
                 // 不与旧法线反向;非脊线塌缩还要求新三角不过分细长。
                 let mut flip = false;
@@ -4172,7 +4174,7 @@ pub mod nets {
                     let mut pv = [[0.0f64; 3]; 3];
                     for k in 0..3 {
                         let vi = t[k] as usize;
-                        if vi == b as usize {
+                        if vi == a as usize || vi == b as usize {
                             pv[k] = pos;
                         } else {
                             let p = self.verts[vi];
@@ -4841,19 +4843,20 @@ pub mod nets {
         axis: usize,
         klo: usize,
         khi: usize,
-        n: usize,
-        dim: usize,
+        shape: [usize; 3],
         vals: &[f32],
         cell_vert: &[u32],
         cell_pack: &[u64],
         verts: &[[f32; 3]],
         out: &mut Vec<[u32; 3]>,
     ) {
+        let [nx, ny, _] = shape;
+        let (dx, dy) = (nx + 1, ny + 1);
         // 取 (cell, 该 cell 内的棱号) 对应的顶点:4 bit 槽号 → 槽内顶点号。
         // 棱号直接取自"这条网格棱在该格内是哪条棱",与端点符号无关 ⟹ 四邻格
         // 各自查到的都是"包含该交叉点的那片表面",不会再跨片错接。
         let vid = |i: usize, j: usize, k: usize, e: usize| -> u32 {
-            let c = (k * n + j) * n + i;
+            let c = (k * ny + j) * nx + i;
             let s = (cell_pack[c] >> (4 * e)) & 0xF;
             if s == 0 {
                 u32::MAX
@@ -4866,10 +4869,10 @@ pub mod nets {
         for k in klo..khi {
             match axis {
                 0 => {
-                    for j in 1..n {
-                        for i in 0..n {
-                            let a = vals[(k * dim + j) * dim + i];
-                            let b = vals[(k * dim + j) * dim + i + 1];
+                    for j in 1..ny {
+                        for i in 0..nx {
+                            let a = vals[(k * dy + j) * dx + i];
+                            let b = vals[(k * dy + j) * dx + i + 1];
                             if (a < 0.0) == (b < 0.0) {
                                 continue;
                             }
@@ -4889,10 +4892,10 @@ pub mod nets {
                     }
                 }
                 1 => {
-                    for j in 0..n {
-                        for i in 1..n {
-                            let a = vals[(k * dim + j) * dim + i];
-                            let b = vals[(k * dim + (j + 1)) * dim + i];
+                    for j in 0..ny {
+                        for i in 1..nx {
+                            let a = vals[(k * dy + j) * dx + i];
+                            let b = vals[(k * dy + j + 1) * dx + i];
                             if (a < 0.0) == (b < 0.0) {
                                 continue;
                             }
@@ -4912,10 +4915,10 @@ pub mod nets {
                     }
                 }
                 _ => {
-                    for j in 1..n {
-                        for i in 1..n {
-                            let a = vals[(k * dim + j) * dim + i];
-                            let b = vals[((k + 1) * dim + j) * dim + i];
+                    for j in 1..ny {
+                        for i in 1..nx {
+                            let a = vals[(k * dy + j) * dx + i];
+                            let b = vals[((k + 1) * dy + j) * dx + i];
                             if (a < 0.0) == (b < 0.0) {
                                 continue;
                             }
@@ -4938,10 +4941,66 @@ pub mod nets {
         }
     }
 
+    // 三线性插值在叶内是角值的凸组合，全非负叶不可能产生负样本。
+    // 在提取格坐标中包住可能含材料的叶，并留一个完整正值网格层供四边形装配。
+    // 小于四格的内部节点直接整体纳入，免去遍历数百万细叶。
+    fn material_region(adf: &Adf, n: usize) -> Option<([usize; 3], [usize; 3])> {
+        let mut lower = [n; 3];
+        let mut upper = [0; 3];
+        let mut stack = vec![(adf.root, [0.0; 3], n as Real)];
+        while let Some((id, origin, width)) = stack.pop() {
+            match &adf.nodes[id as usize] {
+                Node::Leaf(corners) if corners.iter().all(|&v| v >= 0.0) => continue,
+                Node::Internal(children) if width > 4.0 => {
+                    for (i, &child) in children.iter().enumerate() {
+                        stack.push((child, child_origin(origin, width, i), width * 0.5));
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            for a in 0..3 {
+                lower[a] = lower[a].min((origin[a].floor() as usize).saturating_sub(1));
+                upper[a] = upper[a].max(((origin[a] + width).ceil() as usize).saturating_add(1).min(n));
+            }
+        }
+        if lower[0] >= upper[0] { return None; }
+        Some((lower, std::array::from_fn(|a| upper[a] - lower[a])))
+    }
+
     /// 均匀重采样 + Surface Nets 提取。h:重采样格宽(建议 h_min 或其 2 倍)。
     pub fn extract_uniform(adf: &Adf, h: Real) -> Mesh {
+        extract_with_reference(adf, h, None)
+    }
+
+    /// 未切削 STL 重建时，用源三角面与变号格边的交点校准切平面。
+    /// 对切削场或解析毛坯照常提取 ADF，避免把新加工面贴回毛坯。
+    pub fn extract_mesh_roundtrip(adf: &Adf, h: Real) -> Mesh {
+        let reference = match &adf.field.base {
+            BaseField::Mesh(mesh) if adf.field.cuts.is_empty() && mesh.has_paired_edges => Some(mesh),
+            _ => None,
+        };
+        extract_with_reference(adf, h, reference)
+    }
+
+    fn extract_with_reference(adf: &Adf, h: Real, reference: Option<&meshfield::MeshField>) -> Mesh {
         let n = ((adf.size / h).round() as usize).max(1);
-        let dim = n + 1;
+        let Some((offset, shape)) = material_region(adf, n) else {
+            return Mesh { verts: Vec::new(), tris: Vec::new() };
+        };
+        eprintln!("[nets.grid] 全域 {n}³ 格，提取 {} × {} × {} 格", shape[0], shape[1], shape[2]);
+        extract_region(adf, n, offset, shape, reference)
+    }
+
+    fn extract_region(
+        adf: &Adf,
+        n: usize,
+        offset: [usize; 3],
+        shape: [usize; 3],
+        reference: Option<&meshfield::MeshField>,
+    ) -> Mesh {
+        let [nx, ny, nz] = shape;
+        let [dx, dy, dz] = shape.map(|v| v + 1);
         let step = adf.size / n as Real;
         let edge_splits = (1usize << adf.max_depth).div_ceil(n).next_power_of_two().ilog2();
 
@@ -4949,10 +5008,10 @@ pub mod nets {
         //    逐点纯函数、与访问顺序无关 → 按 k 平面切带并行,结果逐位可复现。
         //    dim³ 次 eval 是本函数的主要成本(桌腿 513³≈1.35 亿次,占提取耗时 ~85%);
         //    串行时 4.0s,串行也是它把 extract 顶成全管线最大单项。
-        let mut vals = vec![0f32; dim * dim * dim];
+        let mut vals = vec![0f32; dx * dy * dz];
         {
-            let plane = dim * dim;
-            let ppw = dim.div_ceil(nthreads()).max(1);
+            let plane = dx * dy;
+            let ppw = dz.div_ceil(nthreads()).max(1);
             let band = ppw * plane;
             let chunks: Vec<&mut [f32]> = vals.chunks_mut(band).collect();
             let min = adf.min;
@@ -4963,11 +5022,11 @@ pub mod nets {
                         for (idx, slot) in chunk.iter_mut().enumerate() {
                             let k = k0 + idx / plane;
                             let rem = idx % plane;
-                            let (j, i) = (rem / dim, rem % dim);
+                            let (j, i) = (rem / dx, rem % dx);
                             *slot = adf.eval([
-                                min[0] + i as Real * step,
-                                min[1] + j as Real * step,
-                                min[2] + k as Real * step,
+                                min[0] + (offset[0] + i) as Real * step,
+                                min[1] + (offset[1] + j) as Real * step,
+                                min[2] + (offset[2] + k) as Real * step,
                             ]);
                         }
                     });
@@ -4984,13 +5043,13 @@ pub mod nets {
         //    把两片表面错接到一起 —— P19 遗留破损/翻折襟翼的治本点。
         //    每格至多 4 个分量。它们在顶点数组中连续，每格只存首个索引。
         //    cell_pack:每条棱 4 bit,存"该棱所属分量落在第几个顶点槽"(0 = 无)。
-        let mut cell_vert = vec![u32::MAX; n * n * n];
-        let mut cell_pack = vec![0u64; n * n * n];
+        let mut cell_vert = vec![u32::MAX; nx * ny * nz];
+        let mut cell_pack = vec![0u64; nx * ny * nz];
         let mut verts: Vec<[f32; 3]> = Vec::new();
         {
-            let nslab = n;
-            let mut slabs: Vec<&mut [u32]> = cell_vert.chunks_mut(n * n).collect();
-            let mut packs: Vec<&mut [u64]> = cell_pack.chunks_mut(n * n).collect();
+            let nslab = nz;
+            let mut slabs: Vec<&mut [u32]> = cell_vert.chunks_mut(nx * ny).collect();
+            let mut packs: Vec<&mut [u64]> = cell_pack.chunks_mut(nx * ny).collect();
             debug_assert_eq!(slabs.len(), nslab);
             let locals: Vec<std::sync::Mutex<Vec<[f32; 3]>>> =
                 (0..nslab).map(|_| std::sync::Mutex::new(Vec::new())).collect();
@@ -5027,13 +5086,13 @@ pub mod nets {
                         }
                         for (ck, slab, pk_slab) in mine {
                             let mut out: Vec<[f32; 3]> = Vec::new();
-                            for cj in 0..n {
-                                for ci in 0..n {
+                            for cj in 0..ny {
+                                for ci in 0..nx {
                                     let mut cv = [0f32; 8];
                                     let (mut any_neg, mut any_pos) = (false, false);
                                     for c in 0..8 {
-                                        let (dx, dy, dz) = (c & 1, (c >> 1) & 1, (c >> 2) & 1);
-                                        let v = vals_r[((ck + dz) * dim + (cj + dy)) * dim + (ci + dx)];
+                                        let (cx, cy, cz) = (c & 1, (c >> 1) & 1, (c >> 2) & 1);
+                                        let v = vals_r[((ck + cz) * dy + (cj + cy)) * dx + (ci + cx)];
                                         cv[c] = v;
                                         any_neg |= v < 0.0;
                                         any_pos |= v >= 0.0;
@@ -5120,9 +5179,9 @@ pub mod nets {
                                         pid[e] = rid[r];
                                     }
                                     let o = [
-                                        vmin[0] + ci as Real * step,
-                                        vmin[1] + cj as Real * step,
-                                        vmin[2] + ck as Real * step,
+                                        vmin[0] + (offset[0] + ci) as Real * step,
+                                        vmin[1] + (offset[1] + cj) as Real * step,
+                                        vmin[2] + (offset[2] + ck) as Real * step,
                                     ];
                                     let od = [o[0] as f64, o[1] as f64, o[2] as f64];
                                     let sd = step as f64;
@@ -5166,6 +5225,14 @@ pub mod nets {
                                             }
                                             let mut pt = lo;
                                             pt[axis] += (hi[axis] - lo[axis]) * vlo / (vlo - vhi);
+                                            if let Some((hit, normal)) = reference.and_then(|m| {
+                                                m.edge_plane(pt, axis, pa[axis], pb[axis])
+                                            }) {
+                                                cp[cnt] = hit;
+                                                cn[cnt] = normal;
+                                                cnt += 1;
+                                                continue;
+                                            }
                                             let (corners, local, width) = adf.leaf_coordinates(adf.clamp_to_domain(pt));
                                             let g = tri_grad(corners, local, 1.0 / width);
                                             let gl = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
@@ -5251,12 +5318,12 @@ pub mod nets {
                                             }
                                         }
                                         if nslot == 0 {
-                                            slab[cj * n + ci] = vidx;
+                                            slab[cj * nx + ci] = vidx;
                                         }
                                         out.push([pos[0] as f32, pos[1] as f32, pos[2] as f32]);
                                         nslot += 1;
                                     }
-                                    pk_slab[cj * n + ci] = pk;
+                                    pk_slab[cj * nx + ci] = pk;
                                 }
                             }
                             *locals[ck].lock().unwrap() = out;
@@ -5268,8 +5335,8 @@ pub mod nets {
             for s in 0..nslab {
                 let off = verts.len() as u32;
                 let mut loc = locals[s].lock().unwrap();
-                let base = s * n * n;
-                for e in cell_vert[base..base + n * n].iter_mut() {
+                let base = s * nx * ny;
+                for e in cell_vert[base..base + nx * ny].iter_mut() {
                     if *e != u32::MAX {
                         *e += off;
                     }
@@ -5285,7 +5352,7 @@ pub mod nets {
         let mut tris: Vec<[u32; 3]> = Vec::new();
         for axis in 0..3usize {
             let k_lo = if axis == 2 { 0 } else { 1 };
-            let nslab = n - k_lo;
+            let nslab = nz - k_lo;
             if nslab == 0 {
                 continue;
             }
@@ -5307,8 +5374,7 @@ pub mod nets {
                                 axis,
                                 k_lo + s,
                                 k_lo + s + 1,
-                                n,
-                                dim,
+                                shape,
                                 vals,
                                 cell_vert,
                                 cell_pack,
@@ -5332,6 +5398,54 @@ pub mod nets {
         let flipped = mesh.orient_consistently();
         eprintln!("[nets.winding] 翻正 {flipped} 个三角(绕向一致化)");
         mesh
+    }
+
+    #[test]
+    fn cropped_extraction_matches_the_full_lattice() {
+        // 格数与八叉树深度非整除，材料分别位于域内和域边。
+        for center in [[5.7, 3.13, -1.23], [2.95, 3.5, -1.2]] {
+            let adf = Adf::build(
+                Stock::RoundBox { c: center, half: [0.48, 0.25, 0.7], r: 0.07 },
+                [3.0, 2.0, -5.0], 8.0, 0.003, 0.12, 6,
+            );
+            let n = 59;
+            let (offset, shape) = material_region(&adf, n).unwrap();
+            assert!(shape.iter().product::<usize>() < n.pow(3) / 4, "{offset:?} {shape:?}");
+            let cropped = extract_region(&adf, n, offset, shape, None);
+            let full = extract_region(&adf, n, [0; 3], [n; 3], None);
+            assert!(!full.tris.is_empty());
+            assert_eq!(cropped.verts, full.verts);
+            assert_eq!(cropped.tris, full.tris);
+        }
+    }
+
+    #[test]
+    fn source_planes_recover_an_off_grid_box_corner() {
+        let min = [-0.59, -0.63, -0.51];
+        let max = [0.73, 0.87, 0.69];
+        let vertex = |v| std::array::from_fn(|a: usize| if (v & (1usize << a)) == 0 { min[a] } else { max[a] });
+        let mut triangles = Vec::new();
+        for [a, b, c, d] in [[0,4,6,2], [1,3,7,5], [0,1,5,4], [2,6,7,3], [0,2,3,1], [4,5,7,6]] {
+            triangles.push([vertex(a), vertex(b), vertex(c)]);
+            triangles.push([vertex(a), vertex(c), vertex(d)]);
+        }
+        let adf = Adf::build_with(
+            Composite { base: BaseField::Mesh(meshfield::MeshField::new(triangles)), cuts: Vec::new() },
+            [-2.0; 3], 4.0, 0.001, 0.2, 5,
+        );
+        let mesh = extract_mesh_roundtrip(&adf, 0.5);
+        let error = mesh.verts.iter().map(|v| len(sub(g64(*v), max))).fold(f64::INFINITY, f64::min);
+        assert!(error < 0.005, "upper corner at {max:?} missed by {error} mm");
+        assert_eq!(mesh.edge_stats(), (0, 0, 1));
+        let mut mesh = extract_mesh_roundtrip(&adf, 0.08);
+        let tris_before = mesh.tris.len();
+        mesh.decimate(1e-4, 25.0, 0);
+        assert!(mesh.tris.len() < tris_before / 2);
+        let flat = mesh.tris.iter().filter(|t| {
+            let [a, b, c] = t.map(|id| g64(mesh.verts[id as usize]));
+            cross3(sub(b, a), sub(c, a)) == [0.0; 3]
+        }).count();
+        assert_eq!(flat, 0, "simplified box contains collinear STL facets");
     }
 
     /// 二进制 STL 导出。
@@ -5416,13 +5530,13 @@ pub mod stlio {
         ))
     }
 
-    /// 水密性粗检:顶点去重(0.1µm 格)后统计出现奇数次的边。
-    /// 返回 (三角形数, 是否水密)。
+    /// 顶点按 0.1 µm 合并后，每条非零边应恰有两次反向关联。
     pub fn watertight_report(tris: &[[[Real; 3]; 3]]) -> (usize, bool) {
         use std::collections::HashMap;
         let q = |v: Real| (v * 10000.0).round() as i64; // 0.1µm 量化
         let mut vid: HashMap<[i64; 3], u32> = HashMap::new();
-        let mut edges: HashMap<(u32, u32), u32> = HashMap::new();
+        let mut edges: HashMap<(u32, u32), u8> = HashMap::new();
+        let mut paired = !tris.is_empty();
         let mut nv = 0u32;
         for t in tris {
             let mut ids = [0u32; 3];
@@ -5442,15 +5556,21 @@ pub mod stlio {
             for k in 0..3 {
                 let (a, b) = (ids[k], ids[(k + 1) % 3]);
                 let key = if a < b { (a, b) } else { (b, a) };
-                *edges.entry(key).or_insert(0) += 1;
+                paired &= super::record_edge(edges.entry(key).or_default(), a, b);
             }
         }
-        let odd = edges.values().filter(|&c| c % 2 == 1).count();
-        (tris.len(), odd == 0)
+        (tris.len(), paired && edges.values().all(|&mask| mask == 3))
     }
 }
 
 // ─────────────────── 网格场源:BVH + 最近点 + 射线奇偶符号 ───────────────────
+
+fn record_edge(mask: &mut u8, a: u32, b: u32) -> bool {
+    let bit = if a < b { 1 } else { 2 };
+    let first = a != b && *mask & bit == 0;
+    *mask |= bit;
+    first
+}
 
 pub mod meshfield {
     use super::*;
@@ -5599,6 +5719,7 @@ pub mod meshfield {
     /// 网格场:精确点到网格距离(BVH)+ 射线奇偶符号(+ 位置位模式缓存)。
     /// 已知限制:非水密网格的符号在破洞附近不可靠(§9.2)。
     pub struct MeshField {
+        pub(super) has_paired_edges: bool,
         pub tris: Vec<[[Real; 3]; 3]>,
         bvh: Vec<Bvn>,
         order: Vec<u32>,
@@ -5738,8 +5859,9 @@ pub mod meshfield {
                 tri_vid.push(ids);
             }
             let mut vert_n = vec![[0f64; 3]; nv as usize];
-            let mut edge_n: std::collections::HashMap<(u32, u32), [f64; 3]> =
+            let mut edge_n: std::collections::HashMap<(u32, u32), ([f64; 3], u8)> =
                 std::collections::HashMap::new();
+            let mut has_paired_edges = !tris.is_empty();
             let mut face_n = Vec::with_capacity(tris.len());
             for (ti, t) in tris.iter().enumerate() {
                 let n = cross3(sub3(t[1], t[0]), sub3(t[2], t[0])); // 模长 = 2×面积
@@ -5757,7 +5879,8 @@ pub mod meshfield {
                 for k in 0..3 {
                     let (a, b) = (tri_vid[ti][k], tri_vid[ti][(k + 1) % 3]);
                     let key = if a < b { (a, b) } else { (b, a) };
-                    let e = edge_n.entry(key).or_insert([0.0; 3]);
+                    let (e, mask) = edge_n.entry(key).or_default();
+                    has_paired_edges &= record_edge(mask, a, b);
                     for c in 0..3 {
                         e[c] += n[c];
                     }
@@ -5773,13 +5896,15 @@ pub mod meshfield {
                 .collect();
             let edge_n: std::collections::HashMap<(u32, u32), [f32; 3]> = edge_n
                 .into_iter()
-                .map(|(k, v)| {
+                .map(|(k, (v, mask))| {
+                    has_paired_edges &= mask == 3;
                     let l = len(v);
                     let u = if l > 0.0 { scale3(v, 1.0 / l) } else { [0.0; 3] };
                     (k, [u[0] as f32, u[1] as f32, u[2] as f32])
                 })
                 .collect();
             MeshField {
+                has_paired_edges,
                 tris,
                 bvh,
                 order,
@@ -5797,6 +5922,23 @@ pub mod meshfield {
 
         pub fn triangle_count(&self) -> usize {
             self.tris.len()
+        }
+
+        /// 参考平面只在其与有限格边的交点落在原三角内时才有效。
+        pub(super) fn edge_plane(
+            &self, p: [Real; 3], axis: usize, low: Real, high: Real,
+        ) -> Option<([Real; 3], [Real; 3])> {
+            let (_, id, _, _) = self.closest_features(p);
+            let tri = &self.tris[id as usize];
+            let normal = self.face_n[id as usize].map(Real::from);
+            if normal[axis].abs() <= 1e-8 { return None; }
+            let mut hit = p;
+            hit[axis] += dot3(normal, sub3(tri[0], p)) / normal[axis];
+            if hit[axis] < low || hit[axis] > high { return None; }
+            let projected = closest_point_triangle(hit, tri);
+            let delta = sub3(projected, hit);
+            let tolerance = (high - low) * 1e-6;
+            (dot3(delta, delta) <= tolerance * tolerance).then_some((hit, normal))
         }
 
         /// 精确点到网格距离(非负)。
@@ -6260,6 +6402,28 @@ mod tests {
 
     const MIN: [Real; 3] = [-4.0, -4.0, -4.0];
     const SIZE: Real = 8.0;
+
+    #[test]
+    fn certified_far_leaf_cannot_cross_zero_from_a_coarse_bake_sample() {
+        let stock = BaseField::Stock(Stock::RoundBox { c: [5.0; 3], half: [1.0; 3], r: 0.0 });
+        let grid = BakeGrid { min: [0.0; 3], n: 2, h: 1.0, data: vec![-0.8, 0.9, 1.4, 1.2, 0.7, 1.1, 1.1, 1.2] };
+        let mut nodes = Vec::new();
+        let id = far_leaf(&mut nodes, &ExactSrc::Base(&stock), Some(&grid), 1.0, 0.4, [0.0; 3], 1.0,
+                          4, &mut BuildStats::default());
+        let Node::Leaf(values) = &nodes[id as usize] else { panic!("expected leaf"); };
+        assert!(values.iter().all(|&d| d > 0.0), "certified exterior has signs {values:?}");
+    }
+
+    #[test]
+    fn paired_edges_reject_even_nonmanifold_incidence() {
+        let p = [[0.,0.,0.], [1.,0.,0.], [0.,1.,0.], [0.,0.,1.]];
+        let shell: Vec<_> = [[0,2,1], [0,1,3], [0,3,2], [1,2,3]].map(|t| t.map(|id| p[id])).to_vec();
+        assert!(stlio::watertight_report(&shell).1);
+        assert!(meshfield::MeshField::new(shell.clone()).has_paired_edges);
+        let doubled = shell.repeat(2);
+        assert!(!stlio::watertight_report(&doubled).1);
+        assert!(!meshfield::MeshField::new(doubled).has_paired_edges);
+    }
 
     fn small_adf() -> Adf {
         // 圆角盒 half=2 r=0.5;h_min = 8/2^7 = 0.0625mm;壳层带宽 0.3mm

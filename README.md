@@ -20,6 +20,10 @@ cargo run --release --example check_mesh      # 导出网格体检:分量/碎屑
 cargo run --release --example probe_field     # 场体检:体积/表面邻域/顶点偏离
 ```
 
+无切削的 `stl_roundtrip` 从 ADF 判断表面连接。如果输入的每条边都恰有两个反向相邻面，程序在变号格边上用输入三角形校准交点和法线，再用 QEM 简化并有限度地向源面投影。输入有开放边、多重关联或绕向冲突时，程序采用距离场的交点与后处理。提取器会裁去可证为空气的外围格，日志 `[nets.grid]` 给出实际格数。
+
+设置 `ADF_NO_DEC=1` 可跳过简化及其后处理，`ADF_NO_PROJ=1` 可跳过简化后的投影。`ADF_FIELD_POST=1` 可启用距离场的平滑、吸附及折叠修复。指定 `ADF_REPAIR`、`ADF_SNAP_LIM` 或 `ADF_SNAP_STR` 也会启用这条流程。`ADF_NO_SMOOTH`、`ADF_NO_SNAP2` 与 `ADF_NO_REPAIR2` 分别关闭该流程中的相应步骤。切削演示沿加工后的 ADF 提取和后处理。
+
 ## 性能基线(16 物理核 / 24 逻辑核,Raptor Lake)
 
 | 阶段 | 桌腿固定器(794 tri, depth10) | Turbo Impeller(154870 tri, depth9) |

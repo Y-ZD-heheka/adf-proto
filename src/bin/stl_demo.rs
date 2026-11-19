@@ -25,7 +25,7 @@ fn main() {
     let tm = stlio::load_stl(&path).expect("STL 加载失败");
     println!("[load] {path} | 三角 {} | {:?}", tm.tris.len(), t.elapsed());
     let (nt, watertight) = stlio::watertight_report(&tm.tris);
-    println!("[watertight] 水密={watertight}(三角 {nt},奇数边检查;非水密 → 符号局部不可靠)");
+    println!("[watertight] 三角 {nt}，每条边成对反向关联={watertight}");
     let vol_in = mesh_volume_abs(&tm.tris);
     println!("[volume] 输入网格体积(divergence)= {vol_in:.1} mm³");
 

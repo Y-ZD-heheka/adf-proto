@@ -76,7 +76,7 @@ fn main() {
     // ── 4) 提取 + 体检 + 导出 ──
     let h_ext = h_min * mult;
     let t = Instant::now();
-    let mut mesh = nets::extract_uniform(&adf, h_ext);
+    let mut mesh = nets::extract_mesh_roundtrip(&adf, h_ext);
     // 碎屑清理:丢掉 <50 三角、或体积 <0.01% 总体的孤立分量
     // (场里的小符号岛,在查看器里表现为浮在表面附近的斑点)
     let (nd, nt) = mesh.drop_small_components(50, 1e-4);
@@ -84,15 +84,20 @@ fn main() {
         println!("[clean] 丢弃碎屑分量 {nd} 个 / 三角 {nt}");
     }
     // 平滑 + 投影回零等值面:削掉叶边处的扇贝锯齿(位移上限 = 半格)
-    if std::env::var("ADF_NO_SMOOTH").is_err() {
+    // 参考三角面已提供几何约束。切削演示仍用距离场做平滑和吸附；
+    // 在无切削模式中再次投向近似场会把已经恢复的棱角拉回粗场。
+    let field_post = !watertight || ["ADF_FIELD_POST", "ADF_REPAIR", "ADF_SNAP_LIM", "ADF_SNAP_STR"]
+        .iter().any(|key| std::env::var_os(key).is_some());
+    if !watertight {
+        println!("[reference] 输入边未成对反向关联，使用距离场交点及后处理");
+    }
+    if field_post && std::env::var("ADF_NO_SMOOTH").is_err() {
         let t2 = Instant::now();
         let (dm, dx) = mesh.smooth_and_project(&adf, 3, h_ext as f32 * 0.5);
         println!(
             "[smooth] {:?} | 位移 mean {dm:.4} max {dx:.4} mm",
             t2.elapsed()
         );
-    } else {
-        println!("[smooth] ADF_NO_SMOOTH=1 → 跳过平滑/投影/吸附(原始提取输出)");
     }
     // 折叠/薄片修复:边缘"破损"的真身(真折叠 + 针状薄片),塌缩最短边消除
     if std::env::var("ADF_REPAIR").is_ok() {
@@ -120,7 +125,7 @@ fn main() {
         );
         // 简化把凸曲面顶点按弦高内缩(QEM 最优在曲面内侧),圆缘会变成
         // 多段内凹折线。投影回零面把弦高归零(平面区幂等)。
-        if std::env::var("ADF_NO_PROJ").is_err() {
+        if field_post && std::env::var("ADF_NO_PROJ").is_err() {
             let (pm, px) = mesh.project_to_zero(&adf, 3, h_ext as f64);
             println!("[project] 首轮位移 mean {pm:.4} max {px:.4} mm");
         }
@@ -136,7 +141,7 @@ fn main() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.95);
-        if std::env::var("ADF_NO_SNAP2").is_err() {
+        if field_post && std::env::var("ADF_NO_SNAP2").is_err() {
             let t5 = Instant::now();
             let ns = mesh.snap_sharp_to_rim(&adf, snap_lim, snap_str);
             // 吸附把锐边顶点拉回缘线,邻接窄带三角被挤扁 → 清理针状薄片
