@@ -1878,14 +1878,26 @@ impl Adf {
     /// 自适应求值:下降到包含 p 的叶,角点三线性插值。
     /// 已知限制:跨分辨率边界处插值基不一致,存在 T-junction 误差(spike 要测的就是它)。
     pub fn eval(&self, p: [Real; 3]) -> f32 {
-        let (corners, u, _) = self.leaf_coordinates(p);
+        let (corners, u, _) = self.leaf_coordinates(self.clamp_to_domain(p));
         trilinear(u, corners)
     }
 
-    /// 取求值所在叶、局部坐标及格宽。值和解析梯度使用同一组角点。
-    #[inline]
-    fn leaf_coordinates(&self, p: [Real; 3]) -> (&[f32; 8], [Real; 3], Real) {
+    /// 投影使用 eval 的域外常量外延：被钳位的轴上偏导为零，其余轴保留叶内偏导。
+    fn eval_with_gradient(&self, p: [Real; 3]) -> (Real, [Real; 3]) {
         let q = self.clamp_to_domain(p);
+        let (corners, u, width) = self.leaf_coordinates(q);
+        let mut gradient = tri_grad(corners, u, 1.0 / width);
+        for axis in 0..3 {
+            if q[axis] != p[axis] {
+                gradient[axis] = 0.0;
+            }
+        }
+        (trilinear(u, corners) as Real, gradient)
+    }
+
+    /// 输入已钳位到域内的坐标，取所在叶、局部坐标及格宽。
+    #[inline]
+    fn leaf_coordinates(&self, q: [Real; 3]) -> (&[f32; 8], [Real; 3], Real) {
         let mut o = self.min;
         let mut s = self.size;
         let mut idx = self.root;
@@ -2532,12 +2544,10 @@ pub mod nets {
             for it in 0..iters {
                 for i in 0..n {
                     let q = p[i];
-                    let (corners, u, width) = adf.leaf_coordinates(q);
-                    let d0 = trilinear(u, corners) as f64;
+                    let (d0, g) = adf.eval_with_gradient(q);
                     if !d0.is_finite() || d0.abs() > 8.0 * lim {
                         continue;
                     }
-                    let g = tri_grad(corners, u, 1.0 / width);
                     let g2 = g[0] * g[0] + g[1] * g[1] + g[2] * g[2];
                     if g2 < 0.25 {
                         continue; // 场的奇异处,投影会把点甩远
@@ -2879,14 +2889,12 @@ pub mod nets {
             for _ in 0..8 {
                 for i in 0..n {
                     let q = [p[i][0], p[i][1], p[i][2]];
-                    let (corners, u, width) = adf.leaf_coordinates(q);
-                    let d0 = trilinear(u, corners) as f64;
+                    let (d0, g) = adf.eval_with_gradient(q);
                     // 只挡真正飞掉的点(碎屑已在投影前清理);阈值太紧会把
                     // 锐边处合法的 1mm 级顶点挡在投影门外(实测卡在 1.25mm)
                     if d0.abs() > 8.0 * max_disp as f64 {
                         continue; // 离面太远,不投影
                     }
-                    let g = tri_grad(corners, u, 1.0 / width);
                     let g2 = g[0] * g[0] + g[1] * g[1] + g[2] * g[2];
                     // |∇d| 应≈1;远小于 1 说明落在场的奇异处,投影会把点甩得很远
                     if g2 < 0.25 {
@@ -5158,7 +5166,7 @@ pub mod nets {
                                             }
                                             let mut pt = lo;
                                             pt[axis] += (hi[axis] - lo[axis]) * vlo / (vlo - vhi);
-                                            let (corners, local, width) = adf.leaf_coordinates(pt);
+                                            let (corners, local, width) = adf.leaf_coordinates(adf.clamp_to_domain(pt));
                                             let g = tri_grad(corners, local, 1.0 / width);
                                             let gl = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
                                             cp[cnt] = pt;
@@ -6847,6 +6855,30 @@ mod tests {
         mesh.verts[2] = [0.2, 0.0, 0.5];
         mesh.project_to_reference(&reference, 1.0);
         assert!(mesh.verts[2][2] > 0.125 && mesh.verts[2][2] < 0.5);
+    }
+
+    #[test]
+    fn zero_projection_respects_clamped_axes() {
+        let mut adf = Adf::build(
+            Stock::Sphere { c: [0.0; 3], r: 1.0 },
+            [-2.0; 3], 4.0, 0.005, 0.2, 4,
+        );
+        // 单一三线性叶精确表示 x+y。x 在域外时，组合了钳位的场只沿 y 变化。
+        let corners = std::array::from_fn(|i| {
+            let p = corner_pos(adf.min, adf.size, i);
+            (p[0] + p[1]) as f32
+        });
+        adf.nodes = vec![Node::Leaf(corners)];
+        adf.root = 0;
+        let mut m = nets::Mesh {
+            verts: vec![[10.0, -1.0, 0.0], [-10.0, 1.0, 0.0], [10.0, 10.0, 0.0], [1.0, 0.0, 0.0]],
+            tris: vec![],
+        };
+        m.project_to_zero(&adf, 1, 2.0);
+        assert_eq!(m.verts[0], [10.0, -2.0, 0.0]);
+        assert_eq!(m.verts[1], [-10.0, 2.0, 0.0]);
+        assert_eq!(m.verts[2], [10.0, 10.0, 0.0]);
+        assert_eq!(m.verts[3], [0.5, -0.5, 0.0]);
     }
 
     #[test]
