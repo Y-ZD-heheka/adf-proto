@@ -212,7 +212,7 @@ fn reconstruct_layer(
             && let BaseField::Mesh(reference) = &adf.field.base
         {
             let t = Instant::now();
-            mesh.project_to_reference(reference, h_ext * 0.5);
+            mesh.project_with_face_samples(reference, h_ext * 0.5, preserve_parts);
             println!("[reference] 原始表面投影 {:?}", t.elapsed());
         }
     }

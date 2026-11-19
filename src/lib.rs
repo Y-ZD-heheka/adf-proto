@@ -2584,6 +2584,11 @@ pub mod nets {
         /// 串行验收移动以计入已移动的邻点，保留邻面原方向上的至少 1/4 面积。
         /// 仅走到投影距离的 90%，避免临近锐边的多个顶点重合。
         pub fn project_to_reference(&mut self, reference: &meshfield::MeshField, max_step: f64) {
+            self.project_with_face_samples(reference, max_step, false);
+        }
+
+        /// 简化网格在采样原顶点外，也用每个面的中心估计弦差。
+        pub fn project_with_face_samples(&mut self, reference: &meshfield::MeshField, max_step: f64, fit_faces: bool) {
             if self.verts.is_empty() || !max_step.is_finite() || max_step <= 0.0 {
                 return;
             }
@@ -2615,6 +2620,32 @@ pub mod nets {
                     });
                 }
             });
+            if fit_faces {
+                let mut weighted = vec![([0.0; 3], 0.0); self.verts.len()];
+                for &[a, b, c] in &self.tris {
+                    let [p, q, r] = [a, b, c].map(|i| g64(targets[i as usize]));
+                    let normal = cross3(sub(q, p), sub(r, p));
+                    let area = len(normal);
+                    if area == 0.0 { continue; }
+                    let center = scale(add(add(p, q), r), 1.0 / 3.0);
+                    let (d, _, _, closest) = reference.closest_features(center);
+                    if d > max_step { continue; }
+                    let height = dot3(sub(closest, center), normal) / area;
+                    for i in [a, b, c] {
+                        let (sum, weight) = &mut weighted[i as usize];
+                        *sum = add(*sum, scale(normal, height));
+                        *weight += area;
+                    }
+                }
+                for (i, (sum, weight)) in weighted.into_iter().enumerate() {
+                    if weight == 0.0 { continue; }
+                    // 角点零残差的二次曲面，其面均值等于面心残差的 3/4。
+                    let candidate = add(g64(targets[i]), scale(sum, 0.75 / weight));
+                    let origin = g64(self.verts[i]);
+                    let delta = sub(candidate, origin);
+                    targets[i] = add(origin, scale(delta, (max_step / len(delta)).min(1.0))).map(|v| v as f32);
+                }
+            }
             for (i, target) in targets.into_iter().enumerate() {
                 let original = self.verts[i];
                 if original == target {
@@ -5745,6 +5776,7 @@ pub mod meshfield {
     /// 已知限制:非水密网格的符号在破洞附近不可靠(§9.2)。
     pub struct MeshField {
         pub(super) has_paired_edges: bool,
+        exact_vertex_ids: bool,
         use_even_odd: bool,
         pub tris: Vec<[[Real; 3]; 3]>,
         bvh: Vec<Bvn>,
@@ -5871,6 +5903,7 @@ pub mod meshfield {
             let roundoff = (0..3).map(|a| aabb_max[a] - aabb_min[a]).fold(0.0, Real::max)
                 * (32.0 * Real::EPSILON);
             let mut welded = false;
+            let mut exact_vertex_ids = true;
             let mut nv = 0u32;
             for t in &tris {
                 let mut ids = [0u32; 3];
@@ -5878,6 +5911,7 @@ pub mod meshfield {
                     let key = [q(v[0]), q(v[1]), q(v[2])];
                     let id = match vid_map.get(&key) {
                         Some(&i) => {
+                            exact_vertex_ids &= *v == representatives[i as usize];
                             welded |= (0..3).any(|a| (v[a] - representatives[i as usize][a]).abs() > roundoff);
                             i
                         }
@@ -5956,6 +5990,7 @@ pub mod meshfield {
             let use_even_odd = closed && !has_paired_edges;
             MeshField {
                 has_paired_edges,
+                exact_vertex_ids,
                 use_even_odd,
                 tris,
                 bvh,
@@ -5992,15 +6027,36 @@ pub mod meshfield {
                 }
                 i
             }
-            // 用原坐标连通，避免法线索引的量化误将近重合的独立壳焊在一起。
+            // 只通过整条原始边连接面。两个实体即使共用一个顶点，也可能
+            // 在同一格内有各自的表面。多面共边则保留在同一个三角链中。
             let mut vertices = std::collections::HashMap::new();
+            let mut owners = std::collections::HashMap::new();
+            let paired = self.has_paired_edges && self.exact_vertex_ids;
             for (i, tri) in self.tris.iter().enumerate() {
-                for &v in tri {
-                    let other = *vertices.entry(vertex_key(v)).or_insert(i);
-                    let (a, b) = (root(&mut parents, i), root(&mut parents, other));
-                    parents[a] = b;
+                // 普通流形直接复用已经建立的顶点索引；出现量化合并才重建精确索引。
+                let ids = if self.exact_vertex_ids {
+                    self.tri_vid[i]
+                } else {
+                    tri.map(|v| {
+                        let next = u32::try_from(vertices.len()).expect("顶点数超过 u32 索引范围");
+                        *vertices.entry(vertex_key(v)).or_insert(next)
+                    })
+                };
+                for (a, b) in [(ids[0], ids[1]), (ids[1], ids[2]), (ids[2], ids[0])] {
+                    if a == b { continue; }
+                    use std::collections::hash_map::Entry;
+                    let other = match owners.entry((a.min(b), a.max(b))) {
+                        Entry::Vacant(slot) => { slot.insert(i); continue; }
+                        // 成对边只需保存到第二个面；多面共边则保留首面供后续关联。
+                        Entry::Occupied(slot) if paired => slot.remove(),
+                        Entry::Occupied(slot) => *slot.get(),
+                    };
+                    let (left, right) = (root(&mut parents, i), root(&mut parents, other));
+                    parents[left] = right;
                 }
             }
+            drop(vertices);
+            drop(owners);
             let mut ids = std::collections::HashMap::new();
             let mut shells: Vec<Vec<usize>> = Vec::new();
             for i in 0..parents.len() {
@@ -6610,6 +6666,18 @@ mod tests {
         let layers = meshfield::MeshField::new(hollow).into_roundtrip_layers(0.0625);
         assert_eq!(layers.len(), 1);
         assert!(layers[0].signed_distance_pn([0.125; 3]) > 0.0);
+    }
+
+    #[test]
+    fn roundtrip_separates_solids_touching_only_at_one_vertex() {
+        let p = [[0.,0.,0.], [1.,0.,0.], [0.,1.,0.], [0.,0.,1.]];
+        let outer = [[0,2,1], [0,1,3], [0,3,2], [1,2,3]].map(|t| t.map(|id| p[id]));
+        let inner = outer.map(|t| t.map(|v| v.map(|x| x * 0.5)));
+        let mut input = outer.to_vec();
+        input.extend(inner);
+        let layers = meshfield::MeshField::new(input).into_roundtrip_layers(0.0625);
+        assert_eq!(layers.len(), 2, "point contact must not cancel the two interiors");
+        assert!(layers.iter().all(|m| m.signed_distance_pn([0.125; 3]) < 0.0));
     }
 
     #[test]
@@ -7231,6 +7299,27 @@ mod tests {
         mesh.verts[2] = [0.2, 0.0, 0.5];
         mesh.project_to_reference(&reference, 1.0);
         assert!(mesh.verts[2][2] > 0.125 && mesh.verts[2][2] < 0.5);
+    }
+
+    #[test]
+    fn face_fit_reduces_chord_error_at_the_same_triangle_count() {
+        let p = [[0., 0., 0.], [1., 0., 1.], [0., 1., 1.]];
+        let q = [[0.5, 0., 0.25], [0.5, 0.5, 0.5], [0., 0.5, 0.25]];
+        let source = meshfield::MeshField::new(vec![
+            [p[0], q[0], q[2]], [q[0], p[1], q[1]],
+            [q[2], q[1], p[2]], [q[0], q[1], q[2]],
+        ]);
+        let mut mesh = nets::Mesh { verts: p.map(|v| v.map(|x| x as f32)).to_vec(), tris: vec![[0, 1, 2]] };
+        let center_distance = |m: &nets::Mesh| {
+            let v: Vec<_> = m.verts.iter().map(|p| p.map(Real::from)).collect();
+            source.unsigned_distance(scale(add(add(v[0], v[1]), v[2]), 1.0 / 3.0))
+        };
+        let before = center_distance(&mesh);
+        mesh.project_to_reference(&source, 0.5);
+        assert_eq!(center_distance(&mesh), before);
+        mesh.project_with_face_samples(&source, 0.5, true);
+        assert!(center_distance(&mesh) < before * 0.6);
+        assert_eq!(mesh.tris, [[0, 1, 2]]);
     }
 
     #[test]
