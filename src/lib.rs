@@ -2587,7 +2587,7 @@ pub mod nets {
             self.project_with_face_samples(reference, max_step, false);
         }
 
-        /// 简化网格在采样原顶点外，也用每个面的中心估计弦差。
+        /// 简化网格在采样原顶点外，也用面内三点估计弦差。
         pub fn project_with_face_samples(&mut self, reference: &meshfield::MeshField, max_step: f64, fit_faces: bool) {
             if self.verts.is_empty() || !max_step.is_finite() || max_step <= 0.0 {
                 return;
@@ -2628,19 +2628,28 @@ pub mod nets {
                     let area = len(normal);
                     if area == 0.0 { continue; }
                     let center = scale(add(add(p, q), r), 1.0 / 3.0);
-                    let (d, _, _, closest) = reference.closest_features(center);
-                    if d > max_step { continue; }
-                    let height = dot3(sub(closest, center), normal) / area;
-                    for i in [a, b, c] {
+                    let mut heights = [0.0; 3];
+                    let mut in_band = true;
+                    // (2/3, 1/6, 1/6) 的三个重心坐标给出二次精度的三角形积分。
+                    // 每个残差按该样点的重心权重分回三个顶点，区分叶片上不对称的弯曲。
+                    for (i, point) in [p, q, r].into_iter().enumerate() {
+                        let sample = scale(add(center, point), 0.5);
+                        let (distance, _, _, closest) = reference.closest_features(sample);
+                        in_band &= distance <= max_step;
+                        heights[i] = dot3(sub(closest, sample), normal) / area;
+                    }
+                    if !in_band { continue; }
+                    let total: Real = heights.iter().sum();
+                    for (corner, i) in [a, b, c].into_iter().enumerate() {
                         let (sum, weight) = &mut weighted[i as usize];
+                        let height = (total + 3.0 * heights[corner]) / 6.0;
                         *sum = add(*sum, scale(normal, height));
                         *weight += area;
                     }
                 }
                 for (i, (sum, weight)) in weighted.into_iter().enumerate() {
                     if weight == 0.0 { continue; }
-                    // 角点零残差的二次曲面，其面均值等于面心残差的 3/4。
-                    let candidate = add(g64(targets[i]), scale(sum, 0.75 / weight));
+                    let candidate = add(g64(targets[i]), scale(sum, 1.0 / weight));
                     let origin = g64(self.verts[i]);
                     let delta = sub(candidate, origin);
                     targets[i] = add(origin, scale(delta, (max_step / len(delta)).min(1.0))).map(|v| v as f32);
@@ -5023,6 +5032,21 @@ pub mod nets {
         extract_region(adf, n, offset, shape, reference)
     }
 
+    // 正定 QEF 在交点重心到无约束解的线段上单调下降。取与格壁相交的
+    // 可行线段，微量回退使相邻格的顶点仍分开。
+    fn limit_qef_to_cell(mass: [Real; 3], optimum: [Real; 3], origin: [Real; 3], step: Real) -> [Real; 3] {
+        let delta = sub(optimum, mass);
+        let mut limit = 1.0_f64;
+        for k in 0..3 {
+            if delta[k] > 0.0 {
+                limit = limit.min((origin[k] + step - mass[k]) / delta[k]);
+            } else if delta[k] < 0.0 {
+                limit = limit.min((origin[k] - mass[k]) / delta[k]);
+            }
+        }
+        add(mass, scale(delta, limit.max(0.0) * 0.999))
+    }
+
     fn extract_region(
         adf: &Adf,
         n: usize,
@@ -5333,14 +5357,10 @@ pub mod nets {
                                                 pos[k] = dk / det;
                                             }
                                         }
-                                        for k in 0..3 {
-                                            if !pos[k].is_finite()
-                                                || pos[k] < od[k] - 1e-9
-                                                || pos[k] > od[k] + sd + 1e-9
-                                            {
-                                                pos = mass;
-                                                break;
-                                            }
+                                        if (0..3).any(|k| !pos[k].is_finite()) {
+                                            pos = mass;
+                                        } else if (0..3).any(|k| pos[k] < od[k] - 1e-9 || pos[k] > od[k] + sd + 1e-9) {
+                                            pos = if reference.is_some() { limit_qef_to_cell(mass, pos, od, sd) } else { mass };
                                         }
                                         let vidx = out.len() as u32;
                                         for e in 0..12 {
@@ -5477,6 +5497,16 @@ pub mod nets {
             cross3(sub(b, a), sub(c, a)) == [0.0; 3]
         }).count();
         assert_eq!(flat, 0, "simplified box contains collinear STL facets");
+    }
+
+    #[test]
+    fn outside_qef_minimum_retains_the_feasible_part_of_the_step() {
+        let center = [-0.5, 0.5, 1.5];
+        let target = [-2.0, 0.8, 1.2];
+        let actual = limit_qef_to_cell(center, target, [-1.0, 0.0, 1.0], 1.0);
+        assert!(actual[0] > -1.0 && actual[0] < -0.999);
+        assert!(actual[1] > center[1] && actual[2] < center[2]);
+        assert!(len(sub(actual, target)) < len(sub(center, target)));
     }
 
     /// 二进制 STL 导出。
@@ -6113,17 +6143,52 @@ pub mod meshfield {
         pub(super) fn edge_plane(
             &self, p: [Real; 3], axis: usize, low: Real, high: Real,
         ) -> Option<([Real; 3], [Real; 3])> {
-            let (_, id, _, _) = self.closest_features(p);
-            let tri = &self.tris[id as usize];
-            let normal = self.face_n[id as usize].map(Real::from);
-            if normal[axis].abs() <= 1e-8 { return None; }
-            let mut hit = p;
-            hit[axis] += dot3(normal, sub3(tri[0], p)) / normal[axis];
-            if hit[axis] < low || hit[axis] > high { return None; }
-            let projected = closest_point_triangle(hit, tri);
-            let delta = sub3(projected, hit);
             let tolerance = (high - low) * 1e-6;
-            (dot3(delta, delta) <= tolerance * tolerance).then_some((hit, normal))
+            let intersect = |id: u32| {
+                let tri = &self.tris[id as usize];
+                let normal = self.face_n[id as usize].map(Real::from);
+                if normal[axis].abs() <= 1e-8 { return None; }
+                let mut hit = p;
+                hit[axis] += dot3(normal, sub3(tri[0], p)) / normal[axis];
+                if hit[axis] < low || hit[axis] > high { return None; }
+                let delta = sub3(closest_point_triangle(hit, tri), hit);
+                (dot3(delta, delta) <= tolerance * tolerance).then_some((hit, normal))
+            };
+            let (_, nearest, _, _) = self.closest_features(p);
+            if let Some(hit) = intersect(nearest) { return Some(hit); }
+
+            // 薄壁或转角处最近面可能平行于格边，真实交点在相邻面上。
+            // 检查与这段有限格边相交的 BVH 叶；多次穿越时取最接近场估计的位置。
+            let j = (axis + 1) % 3;
+            let k = (axis + 2) % 3;
+            let mut best = None;
+            let mut best_delta = Real::INFINITY;
+            let mut stack = [0u32; 64];
+            stack[0] = self.root;
+            let mut count = 1;
+            while count > 0 {
+                count -= 1;
+                let node = &self.bvh[stack[count] as usize];
+                if node.mx[axis] < low || node.mn[axis] > high ||
+                    p[j] < node.mn[j] || p[j] > node.mx[j] ||
+                    p[k] < node.mn[k] || p[k] > node.mx[k] { continue; }
+                if node.cnt == 0 {
+                    stack[count] = node.left;
+                    stack[count + 1] = node.right;
+                    count += 2;
+                } else {
+                    for &id in &self.order[node.start as usize..(node.start + node.cnt) as usize] {
+                        if let Some((hit, normal)) = intersect(id) {
+                            let delta = (hit[axis] - p[axis]).abs();
+                            if delta < best_delta {
+                                best_delta = delta;
+                                best = Some((hit, normal));
+                            }
+                        }
+                    }
+                }
+            }
+            best
         }
 
         /// 精确点到网格距离(非负)。
@@ -7320,6 +7385,34 @@ mod tests {
         mesh.project_with_face_samples(&source, 0.5, true);
         assert!(center_distance(&mesh) < before * 0.6);
         assert_eq!(mesh.tris, [[0, 1, 2]]);
+    }
+
+    #[test]
+    fn reference_edge_recovers_a_crossing_hidden_by_a_nearer_parallel_facet() {
+        let mesh = meshfield::MeshField::new(vec![
+            [[0.1, -1.0, 0.01], [0.9, -1.0, 0.01], [0.5, 1.0, 0.01]],
+            [[0.8, -1.0, -1.0], [0.8, 1.0, -1.0], [0.8, 0.0, 1.0]],
+        ]);
+        let (hit, _) = mesh.edge_plane([0.5, 0.0, 0.0], 0, 0.0, 1.0).expect("finite edge intersects x=0.8");
+        assert!((hit[0] - 0.8).abs() < 1e-10);
+        assert!(mesh.edge_plane([0.5, 0.0, 0.0], 0, 0.0, 0.7).is_none());
+    }
+
+    #[test]
+    fn face_samples_resolve_curvature_away_from_the_centroid() {
+        let vertex = |i, j| [i as Real / 6.0, j as Real / 6.0, if (i,j) == (1,1) { 0.06 } else { 0.0 }];
+        let mut fine = Vec::new();
+        for i in 0..6 {
+            for j in 0..6-i {
+                fine.push([vertex(i,j), vertex(i+1,j), vertex(i,j+1)]);
+                if i+j < 5 { fine.push([vertex(i+1,j), vertex(i+1,j+1), vertex(i,j+1)]); }
+            }
+        }
+        let source = meshfield::MeshField::new(fine);
+        let mut coarse = nets::Mesh { verts: vec![[0.,0.,0.], [1.,0.,0.], [0.,1.,0.]], tris: vec![[0,1,2]] };
+        coarse.project_with_face_samples(&source, 0.2, true);
+        assert!(coarse.verts[0][2] > 0.01);
+        assert!(coarse.verts[0][2] > 2.0 * coarse.verts[1][2]);
     }
 
     #[test]
