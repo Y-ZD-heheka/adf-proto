@@ -17,6 +17,8 @@
 //! - 不做跨分辨率表面提取(验证走 `eval`,不输出网格);
 //! - 单线程(确定性优先;并行方案见 §24.5.8 hp-adaptive-SDF 参照)。
 
+mod creases;
+
 pub type Real = f64;
 
 // ─────────────────────────── 基础向量工具 ───────────────────────────
@@ -2379,10 +2381,13 @@ pub mod nets {
         }
     }
 
+    #[derive(Clone)]
     pub struct Mesh {
         pub verts: Vec<[f32; 3]>,
         pub tris: Vec<[u32; 3]>,
     }
+
+    pub use crate::creases::ReferenceCreases;
 
     fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
         [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
@@ -2395,6 +2400,40 @@ pub mod nets {
     }
 
     impl Mesh {
+        /// STL encodes coordinates without vertex indices. Two used vertex IDs at
+        /// the same f32 position will falsely meet when the exported STL is read.
+        pub fn has_coincident_export_vertices(&self) -> bool {
+            let mut visited = vec![false; self.verts.len()];
+            let mut coordinates = std::collections::HashSet::with_capacity(self.verts.len());
+            for &id in self.tris.iter().flatten() {
+                let id = id as usize;
+                if visited[id] { continue; }
+                visited[id] = true;
+                let key = self.verts[id].map(|x| if x == 0.0 { 0 } else { x.to_bits() });
+                if !coordinates.insert(key) { return true; }
+            }
+            false
+        }
+
+        fn crease_targets(&self, grid: &ReferenceCreases, radius: Real) -> Vec<Option<[Real;3]>> {
+            let nearby: Vec<_> = self.verts.iter().map(|&p| grid.contains_nearby_segment(g64(p))).collect();
+            let mut fans = vec![Vec::new(); self.verts.len()];
+            for &t in &self.tris {
+                if !t.iter().any(|&i| nearby[i as usize]) { continue; }
+                let [a,b,c] = t.map(|i| g64(self.verts[i as usize]));
+                let n = cross3(sub(b,a),sub(c,a));
+                let length = len(n);
+                if length > 0.0 {
+                    let normal = scale(n, 1. / length);
+                    for i in t {
+                        if nearby[i as usize] { fans[i as usize].push(normal); }
+                    }
+                }
+            }
+            self.verts.iter().zip(fans).map(|(&p, fan)| {
+                if fan.is_empty() { None } else { grid.target(g64(p), &fan, radius) }
+            }).collect()
+        }
         /// **绕向统一**:从每个三角沿共享边洪泛,凡与已定向邻居"同向穿过同一条边"的
         /// 三角就翻转(交换两个顶点)。最后按有符号体积判整体朝向,必要时整体翻。
         ///
@@ -2589,6 +2628,10 @@ pub mod nets {
 
         /// 简化网格在采样原顶点外，也用面内三点估计弦差。
         pub fn project_with_face_samples(&mut self, reference: &meshfield::MeshField, max_step: f64, fit_faces: bool) {
+            self.fit_reference(reference, max_step, fit_faces, None);
+        }
+
+        pub fn fit_reference(&mut self, reference: &meshfield::MeshField, max_step: f64, fit_faces: bool, creases: Option<&ReferenceCreases>) {
             if self.verts.is_empty() || !max_step.is_finite() || max_step <= 0.0 {
                 return;
             }
@@ -2653,6 +2696,11 @@ pub mod nets {
                     let origin = g64(self.verts[i]);
                     let delta = sub(candidate, origin);
                     targets[i] = add(origin, scale(delta, (max_step / len(delta)).min(1.0))).map(|v| v as f32);
+                }
+            }
+            if let Some(grid) = creases {
+                for (target, crease) in targets.iter_mut().zip(self.crease_targets(grid, grid.radius)) {
+                    if let Some(point) = crease { *target = point.map(|v| v as f32); }
                 }
             }
             for (i, target) in targets.into_iter().enumerate() {
@@ -3837,6 +3885,11 @@ pub mod nets {
         /// `feature_deg`: 特征边二面角阈值;`target_tris`: 0 = 纯误差驱动。
         /// 返回(塌缩次数, 简化后三角数)。
         pub fn decimate(&mut self, err2_max: f64, feature_deg: f64, target_tris: usize) -> usize {
+            self.decimate_with_creases(err2_max, feature_deg, target_tris, None)
+        }
+
+        pub fn decimate_with_creases(&mut self, err2_max: f64, feature_deg: f64, target_tris: usize, creases: Option<&ReferenceCreases>) -> usize {
+            let mut keep = creases.map(|g| self.crease_targets(g, err2_max.sqrt().max(0.04 * g.radius)));
             // 脊线(二面角>25°)的合并上限:**与 err2 解耦**。阶梯合并代价由
             // 采样步长决定(~2.5e-3 mm² @ h≈0.1),把它绑在 err2 上意味着
             // "用户收紧弦差预算"会顺带让直角缘阶梯退不回去(实测 50×2.5e-5
@@ -4097,6 +4150,7 @@ pub mod nets {
                 if ver[a as usize] != va || ver[b as usize] != vb {
                     continue; // 懒失效
                 }
+                if keep.as_ref().is_some_and(|v| v[a as usize].is_some() && v[b as usize].is_some()) { continue; }
                 if n_live <= target_tris && target_tris > 0 {
                     break;
                 }
@@ -4201,7 +4255,11 @@ pub mod nets {
                     self.verts[b as usize],
                 );
                 // 两端都移动到同一 f32 导出坐标。用该坐标验证两端的存留面。
-                let pos = pos.map(|v| v as f32 as f64);
+                let mut pos = pos.map(|v| v as f32 as f64);
+                if let Some(fixed) = keep.as_ref().and_then(|v| v[a as usize].or(v[b as usize])) {
+                    pos = fixed.map(|v| v as f32 as f64);
+                    if quad_eval(&q[a as usize], pos) + quad_eval(&q[b as usize], pos) > thr { continue; }
+                }
                 // 翻转检查 + 纵横比守卫:环绕三角(含 b→pos 代换)新法线
                 // 不与旧法线反向;非脊线塌缩还要求新三角不过分细长。
                 let mut flip = false;
@@ -4265,6 +4323,7 @@ pub mod nets {
                     continue;
                 }
                 // ── 执行塌缩:b → a ──
+                if let Some(v) = keep.as_mut() { v[a as usize] = v[a as usize].or(v[b as usize]); }
                 self.verts[a as usize] = [pos[0] as f32, pos[1] as f32, pos[2] as f32];
                 for k in 0..10 {
                     q[a as usize][k] += q[b as usize][k];
@@ -5831,6 +5890,36 @@ pub mod meshfield {
     }
 
     impl MeshField {
+        /// Two consistently oriented, nondegenerate facets meeting at a sharp edge.
+        /// Discard open and multiply incident edges, including coincident sheets.
+        pub(super) fn sharp_segments(&self, angle: Real) -> Vec<crate::creases::Segment> {
+            let mut incidence = std::collections::HashMap::<(u32,u32), (u32,u8,u8)>::new();
+            let cos_angle = angle.to_radians().cos();
+            let mut segments = Vec::new();
+            for (i, ids) in self.tri_vid.iter().enumerate() {
+                for k in 0..3 {
+                    let (a,b) = (ids[k], ids[(k+1)%3]);
+                    let e = incidence.entry((a.min(b), a.max(b))).or_insert((i as u32,k as u8,0));
+                    e.2 = e.2.saturating_add(1);
+                }
+            }
+            for (i, ids) in self.tri_vid.iter().enumerate() {
+                for k in 0..3 {
+                    let (a,b) = (ids[k], ids[(k+1)%3]);
+                    let (j,l,count) = incidence[&(a.min(b), a.max(b))];
+                    let (j,l) = (j as usize,l as usize);
+                    if count != 2 || i == j { continue; }
+                    let edge = [self.tris[i][k], self.tris[i][(k+1)%3]];
+                    if edge != [self.tris[j][(l+1)%3],self.tris[j][l]] { continue; }
+                    let normals = [self.face_n[i],self.face_n[j]].map(|n| n.map(Real::from));
+                    if normals.iter().all(|n| dot3(*n,*n) > 0.9) && dot3(normals[0],normals[1]) < cos_angle {
+                        segments.push((edge,normals));
+                    }
+                }
+            }
+            segments
+        }
+
         pub fn new(tris: Vec<[[Real; 3]; 3]>) -> MeshField {
             // 空网格:根会是 cnt=0 的"叶",查询按 cnt>0 判叶会一路下降到 (0,0) 自环。
             // 距离场对空网格无定义,早失败优于死循环。
@@ -7396,6 +7485,34 @@ mod tests {
         let (hit, _) = mesh.edge_plane([0.5, 0.0, 0.0], 0, 0.0, 1.0).expect("finite edge intersects x=0.8");
         assert!((hit[0] - 0.8).abs() < 1e-10);
         assert!(mesh.edge_plane([0.5, 0.0, 0.0], 0, 0.0, 0.7).is_none());
+    }
+
+    #[test]
+    fn reconstruction_keeps_a_sharp_ridge_on_both_supporting_planes() {
+        let source = meshfield::MeshField::new(vec![
+            [[0.,0.,0.], [2.,0.,0.], [0.,1.,0.]],
+            [[0.,0.,0.], [0.,0.,1.], [2.,0.,0.]],
+        ]);
+        let mut mesh = nets::Mesh {
+            verts: vec![[0.2,0.06,0.04],[1.4,0.06,0.04],[0.2,0.8,0.],[0.2,0.,0.8]],
+            tris: vec![[0,1,2],[0,3,1]],
+        };
+        let creases = nets::ReferenceCreases::new(&source, 0.4, 35.0);
+        mesh.fit_reference(&source, 0.2, true, Some(&creases));
+        for p in &mesh.verts[..2] {
+            assert!(p[1].abs().max(p[2].abs()) < 0.005, "ridge drift: {p:?}");
+        }
+    }
+
+    #[test]
+    fn exported_coincidence_checks_used_indices_and_canonicalizes_signed_zero() {
+        let mut m = nets::Mesh {
+            verts: vec![[0.,0.,0.], [1.,0.,0.], [0.,1.,0.], [-0.,0.,0.], [0.,0.,1.]],
+            tris: vec![[0,1,2]],
+        };
+        assert!(!m.has_coincident_export_vertices());
+        m.tris.push([3,2,4]);
+        assert!(m.has_coincident_export_vertices());
     }
 
     #[test]

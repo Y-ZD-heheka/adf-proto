@@ -163,7 +163,13 @@ fn reconstruct_layer(
         let nt0 = mesh.tris.len();
         // 特征保护角(ADF_FEAT_DEG,默认 25°):planar-pair 约束的边阈值
         let feat_deg: f64 = std::env::var("ADF_FEAT_DEG").ok().and_then(|v| v.parse().ok()).unwrap_or(25.0);
-        let nc = mesh.decimate(err2, feat_deg, 0);
+        let creases = match &adf.field.base {
+            BaseField::Mesh(source) if closed && !field_post && !preserve_parts =>
+                Some(nets::ReferenceCreases::new(source, h_ext * 1.2, feat_deg.max(35.0))),
+            _ => None,
+        };
+        let before_crease_fit = creases.as_ref().map(|_| mesh.clone());
+        let nc = mesh.decimate_with_creases(err2, feat_deg, 0, creases.as_ref());
         println!(
             "[decimate] {:?} | 塌缩 {nc} 边 | 三角 {nt0} → {} | 文件 ≈{} MB",
             t4.elapsed(),
@@ -212,8 +218,21 @@ fn reconstruct_layer(
             && let BaseField::Mesh(reference) = &adf.field.base
         {
             let t = Instant::now();
-            mesh.project_with_face_samples(reference, h_ext * 0.5, closed);
+            mesh.fit_reference(reference, h_ext * 0.5, closed, creases.as_ref());
             println!("[reference] 原始表面投影 {:?}", t.elapsed());
+        }
+        // 不同索引精确落到同一 f32 导出坐标时，STL 读回会改变顶点关联。
+        // 在原有提取结果上重做常规简化，保留薄壁原有的连接关系。
+        if let Some(original) = before_crease_fit
+            && mesh.has_coincident_export_vertices()
+            && let BaseField::Mesh(reference) = &adf.field.base
+        {
+            mesh = original;
+            mesh.decimate(err2, feat_deg, 0);
+            if std::env::var("ADF_NO_PROJ").is_err() {
+                mesh.project_with_face_samples(reference, h_ext * 0.5, closed);
+            }
+            println!("[reference] 独立索引投影至重合坐标，已采用曲面拟合");
         }
     }
     mesh
