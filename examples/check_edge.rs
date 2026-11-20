@@ -118,7 +118,7 @@ fn main() {
                 if cos_ab_cb > -0.5 {
                     continue; // b 不是近似在 a—c 中间(端点/分叉处)
                 }
-                let ac = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pc[2]];
+                let ac = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
                 let lac = (ac[0] * ac[0] + ac[1] * ac[1] + ac[2] * ac[2]).sqrt();
                 if lac < 1e-9 {
                     continue;
