@@ -69,6 +69,54 @@ impl ReferenceCreases {
         self.cells.contains_key(&self.cell(p))
     }
 
+    /// All indexed crease segments: (endpoints, the two source face normals).
+    pub(crate) fn segments(&self) -> &[Segment] {
+        &self.segments
+    }
+
+    /// Crease-graph vertices whose crease degree is not 2: where creases meet,
+    /// branch or end (e.g. a circle tangent to a square edge). Sorted for
+    /// deterministic processing.
+    pub(crate) fn corners(&self) -> Vec<[Real; 3]> {
+        let mut degree: std::collections::HashMap<[u64; 3], ([Real; 3], u32)> = Default::default();
+        for &([a, b], _) in &self.segments {
+            for p in [a, b] {
+                degree.entry(p.map(|v| (v + 0.0).to_bits())).or_insert((p, 0)).1 += 1;
+            }
+        }
+        let mut out: Vec<[Real; 3]> = degree.into_values().filter(|&(_, d)| d != 2).map(|(p, _)| p).collect();
+        out.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])).then(a[2].total_cmp(&b[2])));
+        out
+    }
+
+    /// Nearest indexed crease segment to `p`: (distance, closest point, the two source
+    /// face normals). `None` when no segment lies within the index radius (cells are
+    /// expanded by `radius`). Unlike [`target`](Self::target) there is no two-sided
+    /// support test: it answers "is this vertex on a source crease line", used by the
+    /// spur cleanup (P26/P27).
+    pub(crate) fn nearest(&self, p: [Real; 3]) -> Option<(Real, [Real; 3], [[Real; 3]; 2])> {
+        let entries = self.cells.get(&self.cell(p))?;
+        let mut best: Option<(Real, [Real; 3], [[Real; 3]; 2])> = None;
+        for &id in entries {
+            let ([a, b], normals) = self.segments[id];
+            let ab = sub(b, a);
+            let ab2 = dot(ab, ab);
+            let t = if ab2 > 0.0 { (dot(sub(p, a), ab) / ab2).clamp(0., 1.) } else { 0.0 };
+            let q = add(a, scale(ab, t));
+            let delta = sub(q, p);
+            let d2 = dot(delta, delta);
+            if best.is_none_or(|(b2, _, _)| d2 < b2) {
+                best = Some((d2, q, normals));
+            }
+        }
+        best.map(|(d2, q, normals)| (d2.sqrt(), q, normals))
+    }
+
+    /// Distance part of [`nearest`](Self::nearest).
+    pub(crate) fn distance(&self, p: [Real; 3]) -> Option<Real> {
+        self.nearest(p).map(|(d, _, _)| d)
+    }
+
     pub(crate) fn target(
         &self,
         p: [Real; 3],

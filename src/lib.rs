@@ -263,6 +263,19 @@ impl LatticeCache {
         ((k[2] & m) as usize * PAGE_SIDE + (k[1] & m) as usize) * PAGE_SIDE + (k[0] & m) as usize
     }
 
+    /// 内存分项:(页目录字节, 已发布页载荷字节, 已发布页数)。
+    fn mem_bytes(&self) -> (usize, usize, usize) {
+        use std::mem::size_of;
+        let dir = self.pages.capacity() * size_of::<std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicU32>>()
+            + self.locks.capacity() * size_of::<std::sync::Mutex<()>>();
+        let n = self
+            .pages
+            .iter()
+            .filter(|p| !p.load(std::sync::atomic::Ordering::Relaxed).is_null())
+            .count();
+        (dir, n * PAGE_CELLS * 4, n)
+    }
+
     /// 页发布(页锁内双检,只发生一次):分配全 NaN 哨兵页,读路径此后无锁。
     fn publish(&self, page: usize) -> *mut std::sync::atomic::AtomicU32 {
         {
@@ -875,9 +888,52 @@ pub enum Node {
 
 pub const EMPTY: u32 = u32::MAX;
 
+/// ADF 常驻内存分项(字节)。
+///
+/// 为什么单独列出 `lattice_dir`:页目录是 **(2^depth+1)/2^PAGE_BITS 的三次方**
+/// 个指针 + 同数量的锁,深度 10、PAGE_BITS=2 时是 257³×2 个槽 —— 与树本身
+/// 同量级。只统计"已发布页载荷"会低估一个数量级。
 #[derive(Default, Clone, Copy, Debug)]
-pub struct BuildStats {
-    pub subdivided: u64,
+pub struct AdfMem {
+    /// 八叉树节点(容量口径)
+    pub tree: usize,
+    /// 格点缓存页目录(指针表 + 锁表)
+    pub lattice_dir: usize,
+    /// 格点缓存已发布页的载荷(f32 稠密立方)
+    pub lattice_pages: usize,
+    /// 已发布页数
+    pub lattice_page_count: usize,
+    /// 粗距烘焙网格
+    pub bake: usize,
+    /// 源网格场(三角 / BVH / AABB / 法线 / 边表)
+    pub field: usize,
+    /// 切削胶囊
+    pub cuts: usize,
+}
+
+impl AdfMem {
+    pub fn total(&self) -> usize {
+        self.tree + self.lattice_dir + self.lattice_pages + self.bake + self.field + self.cuts
+    }
+    /// 单行摘要(日志/CLI 用)。
+    pub fn summary(&self) -> String {
+        let m = |b: usize| b as f64 / (1024.0 * 1024.0);
+        format!(
+            "合计 {:.1} MB = 树 {:.1} + 页目录 {:.1} + 页载荷 {:.1}({} 页) + 烘焙 {:.1} + 网格场 {:.1} + 切削 {:.1}",
+            m(self.total()),
+            m(self.tree),
+            m(self.lattice_dir),
+            m(self.lattice_pages),
+            self.lattice_page_count,
+            m(self.bake),
+            m(self.field),
+            m(self.cuts)
+        )
+    }
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+pub struct BuildStats {    pub subdivided: u64,
     pub leaves: u64,
     pub sd_evals: u64,
     pub leaf_depth: [u64; 17],
@@ -2324,6 +2380,29 @@ impl Adf {
     }
 
     /// 叶统计:(数量, 估算字节, 深度直方图)。
+    /// ADF 常驻内存分项(容量口径,含它拥有的源网格场)。
+    pub fn mem_bytes(&self) -> AdfMem {
+        use std::mem::size_of;
+        let mut m = AdfMem {
+            tree: self.nodes.capacity() * size_of::<Node>(),
+            cuts: self.field.cuts.capacity() * size_of::<Capsule>(),
+            ..AdfMem::default()
+        };
+        if let Some(l) = &self.lattice {
+            let (d, p, n) = l.mem_bytes();
+            m.lattice_dir = d;
+            m.lattice_pages = p;
+            m.lattice_page_count = n;
+        }
+        if let Some(g) = &self.bake {
+            m.bake = g.data.capacity() * size_of::<f32>() + size_of::<BakeGrid>();
+        }
+        if let BaseField::Mesh(f) = &self.field.base {
+            m.field = f.mem_bytes();
+        }
+        m
+    }
+
     pub fn leaf_stats_bytes(&self) -> (u64, u64, [u64; 17]) {
         let mut n = 0u64;
         let mut bytes = 0u64;
@@ -2333,11 +2412,11 @@ impl Adf {
             match self.nodes[idx as usize] {
                 Node::Leaf(_) => {
                     n += 1;
-                    bytes += 40; // [f32;8] + enum 标签/对齐
+                    bytes += std::mem::size_of::<Node>() as u64; // 实测 36 B([f32;8] + 1 B 标签,对齐 4)
                     hist[d as usize] += 1;
                 }
                 Node::Internal(ch) => {
-                    bytes += 40;
+                    bytes += std::mem::size_of::<Node>() as u64;
                     for c in ch {
                         stack.push((c, d + 1));
                     }
@@ -2418,6 +2497,453 @@ pub mod nets {
         [v[0] as f64, v[1] as f64, v[2] as f64]
     }
 
+    // ── 折痕毛刺清理(P26/P27)用的小工具 ──
+    /// 薄片判据的最小高度(mm),与 qa_render 的 sliver 口径一致。
+    const SPUR_SLIVER_H: f64 = 0.01;
+    fn spur_edge_key(a: u32, b: u32) -> u64 {
+        if a < b { ((a as u64) << 32) | b as u64 } else { ((b as u64) << 32) | a as u64 }
+    }
+    fn spur_normal(p: [[f64; 3]; 3]) -> [f64; 3] {
+        cross3(sub(p[1], p[0]), sub(p[2], p[0]))
+    }
+    fn spur_emax(p: [[f64; 3]; 3]) -> f64 {
+        len(sub(p[1], p[0])).max(len(sub(p[2], p[1]))).max(len(sub(p[0], p[2])))
+    }
+    /// 归一化质量 2A / 最长边²(等边 0.866)。
+    fn spur_quality(p: [[f64; 3]; 3]) -> f64 {
+        let e = spur_emax(p);
+        if e > 0.0 { len(spur_normal(p)) / (e * e) } else { 0.0 }
+    }
+    /// 最小高度 2A / 最长边。
+    fn spur_height(p: [[f64; 3]; 3]) -> f64 {
+        let e = spur_emax(p);
+        if e > 0.0 { len(spur_normal(p)) / e } else { 0.0 }
+    }
+    /// 面法线与质心处最近源折痕两侧法线的最大一致度;附近无折痕时 −1。
+    fn spur_agree(grid: &ReferenceCreases, p: [[f64; 3]; 3]) -> f64 {
+        let n = spur_normal(p);
+        let l = len(n);
+        if l < 1e-14 {
+            return -1.0;
+        }
+        let c = scale(add(add(p[0], p[1]), p[2]), 1.0 / 3.0);
+        match grid.nearest(c) {
+            Some((_, _, [a, b])) => dot3(n, a).max(dot3(n, b)) / l,
+            None => -1.0,
+        }
+    }
+    /// P29:新面在源网格上的采样复核。按 ≤0.3mm 间距(每边 2–8 段)取重心网格点(不含 3 个顶点,
+    /// 它们本来就在源面上),要求到源面距离 ≤ `tol`,法线与最近源面(或其旁的源折痕两侧)一致度 ≥ `agree`。
+    fn ref_sample_ok(reference: &meshfield::MeshField, grid: &ReferenceCreases, p: [[f64; 3]; 3], tol: f64, agree: f64) -> bool {
+        let n = spur_normal(p);
+        let l = len(n);
+        if l < 1e-14 {
+            return false;
+        }
+        let n = scale(n, 1.0 / l);
+        let m = (spur_emax(p) / 0.3).ceil().clamp(2.0, 8.0) as usize;
+        for i in 0..=m {
+            for j in 0..=(m - i) {
+                let k = m - i - j;
+                if i == m || j == m || k == m {
+                    continue;
+                }
+                let s = scale(
+                    add(add(scale(p[0], i as f64), scale(p[1], j as f64)), scale(p[2], k as f64)),
+                    1.0 / m as f64,
+                );
+                let (d, t, _, _) = reference.closest_features(s);
+                if d > tol {
+                    return false;
+                }
+                let mut ag = dot3(n, reference.face_normal(t));
+                if ag < agree
+                    && let Some((dk, _, [a, b])) = grid.nearest(s)
+                    && dk <= d + 0.005
+                {
+                    ag = ag.max(dot3(n, a)).max(dot3(n, b));
+                }
+                if ag < agree {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    /// 面相对源网格的缺陷判据与代价(P28)。返回 (是否可见缺陷, 代价)。
+    /// 可见缺陷:7 个采样点(3 顶点、质心、3 边中点)到源面最大距离 > 0.02mm,或质心处法线与
+    /// 最近源面 / 最近源折痕两侧法线的最大一致度 < 0.8,或退化。
+    fn ref_face_cost(reference: &meshfield::MeshField, grid: &ReferenceCreases, p: [[f64; 3]; 3]) -> (bool, f64) {
+        let c = scale(add(add(p[0], p[1]), p[2]), 1.0 / 3.0);
+        let samples = [
+            p[0],
+            p[1],
+            p[2],
+            c,
+            scale(add(p[0], p[1]), 0.5),
+            scale(add(p[1], p[2]), 0.5),
+            scale(add(p[2], p[0]), 0.5),
+        ];
+        let mut dmax: f64 = 0.0;
+        for s in samples {
+            dmax = dmax.max(reference.closest_features(s).0);
+        }
+        let n = spur_normal(p);
+        let l = len(n);
+        let agree = if l < 1e-14 {
+            -1.0
+        } else {
+            let (dc, t, _, _) = reference.closest_features(c);
+            let mut ag = dot3(n, reference.face_normal(t)) / l;
+            if let Some((dk, _, [a, b])) = grid.nearest(c)
+                && dk <= dc + 0.005
+            {
+                ag = ag.max(dot3(n, a).max(dot3(n, b)) / l);
+            }
+            ag
+        };
+        let bad = dmax > 0.02 || agree < 0.8;
+        let cost = (dmax - 0.01).max(0.0) + (0.9 - agree).max(0.0) * 0.05 + if l < 1e-14 { 0.05 } else { 0.0 };
+        (bad, cost)
+    }
+    /// P30 折痕嵌入的工作状态:边 → 面表、顶点空间哈希(重合检查),以及带守卫的边/面分裂。
+    struct CreaseEmbed<'a> {
+        verts: &'a mut Vec<[f32; 3]>,
+        tris: &'a mut Vec<[u32; 3]>,
+        emap: std::collections::HashMap<u64, Vec<u32>, FxBuild>,
+        vhash: std::collections::HashMap<[i64; 3], Vec<u32>, FxBuild>,
+        cell: f64,
+        on_tol: f64,
+    }
+
+    impl<'a> CreaseEmbed<'a> {
+        fn new(verts: &'a mut Vec<[f32; 3]>, tris: &'a mut Vec<[u32; 3]>, on_tol: f64) -> Self {
+            let cell = (on_tol * 4.0).max(1e-3);
+            let mut emap: std::collections::HashMap<u64, Vec<u32>, FxBuild> =
+                std::collections::HashMap::with_capacity_and_hasher(tris.len() * 3, FxBuild);
+            for (ti, t) in tris.iter().enumerate() {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    emap.entry(spur_edge_key(a, b)).or_default().push(ti as u32);
+                }
+            }
+            let mut vhash: std::collections::HashMap<[i64; 3], Vec<u32>, FxBuild> =
+                std::collections::HashMap::with_capacity_and_hasher(verts.len(), FxBuild);
+            for (vi, v) in verts.iter().enumerate() {
+                vhash.entry(g64(*v).map(|x| (x / cell).floor() as i64)).or_default().push(vi as u32);
+            }
+            Self { verts, tris, emap, vhash, cell, on_tol }
+        }
+
+        fn pos(&self, i: u32) -> [f64; 3] {
+            g64(self.verts[i as usize])
+        }
+
+        fn near_vertex(&self, p: [f64; 3]) -> bool {
+            let k = p.map(|x| (x / self.cell).floor() as i64);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if let Some(list) = self.vhash.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) {
+                            if list.iter().any(|&v| len(sub(self.pos(v), p)) < self.on_tol) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        }
+
+        fn add_vertex(&mut self, p: [f64; 3]) -> u32 {
+            let id = self.verts.len() as u32;
+            let pf = p.map(|x| x as f32);
+            self.verts.push(pf);
+            self.vhash.entry(g64(pf).map(|x| (x / self.cell).floor() as i64)).or_default().push(id);
+            id
+        }
+
+        fn set_face(&mut self, fi: u32, t: [u32; 3]) {
+            let old = self.tris[fi as usize];
+            for (a, b) in [(old[0], old[1]), (old[1], old[2]), (old[2], old[0])] {
+                if let Some(list) = self.emap.get_mut(&spur_edge_key(a, b)) {
+                    list.retain(|&f| f != fi);
+                    if list.is_empty() {
+                        self.emap.remove(&spur_edge_key(a, b));
+                    }
+                }
+            }
+            self.tris[fi as usize] = t;
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                self.emap.entry(spur_edge_key(a, b)).or_default().push(fi);
+            }
+        }
+
+        fn push_face(&mut self, t: [u32; 3]) {
+            let fi = self.tris.len() as u32;
+            self.tris.push(t);
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                self.emap.entry(spur_edge_key(a, b)).or_default().push(fi);
+            }
+        }
+
+        /// 子面 `pn` 替换(或部分替换)原面 `po` 时是否可接受。
+        fn sub_ok(po: [[f64; 3]; 3], pn: [[f64; 3]; 3], side: Option<[[f64; 3]; 2]>) -> bool {
+            let (no, nn) = (spur_normal(po), spur_normal(pn));
+            let (lo, ln) = (len(no), len(nn));
+            if ln < 1e-12 || lo < 1e-14 {
+                return false;
+            }
+            let agree = side.map_or(-1.0, |[n1, n2]| dot3(nn, n1).max(dot3(nn, n2)) / ln);
+            // 子面与某侧源法线一致(≥ 0.9)就接受,不再与原面比较:被切的原面本身可能是斜跨折痕、
+            // 朝向已偏的坏面(桌腿 −Y 切点处原面法线 (−0.39, −0.87, −0.3),切出的 +x 子面与它点积
+            // −0.39,旧判据拒绝,留下一根伸出棱线的"刺",P31)。
+            if dot3(no, nn) < 0.2 * lo * ln && agree < 0.9 {
+                return false;
+            }
+            !(side.is_some() && spur_quality(pn) >= 0.02 && agree < 0.5)
+        }
+
+        /// 在边 (a, b) 上点 p 处分裂(所有相邻面各一分为二)。守卫不过则不改动,返回 None。
+        fn try_split_edge(&mut self, a: u32, b: u32, p: [f64; 3], side: Option<[[f64; 3]; 2]>) -> Option<u32> {
+            let faces = self.emap.get(&spur_edge_key(a, b))?.clone();
+            if faces.is_empty() || faces.len() > 2 || self.near_vertex(p) {
+                return None;
+            }
+            let p = p.map(|x| x as f32 as f64);
+            let mut plan: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(2);
+            for &fi in &faces {
+                let t = self.tris[fi as usize];
+                let po = t.map(|i| self.pos(i));
+                if let Some([n1, n2]) = side {
+                    let nf = spur_normal(po);
+                    if dot3(nf, n1).max(dot3(nf, n2)) < 0.5 * len(nf) {
+                        return None;
+                    }
+                }
+                let i = t.iter().position(|&v| v == a)?;
+                let (x, y) = if t[(i + 1) % 3] == b { (a, b) } else { (b, a) };
+                let k = t.iter().position(|&v| v == x)?;
+                let r = t[(k + 2) % 3];
+                for pn in [[self.pos(x), p, self.pos(r)], [p, self.pos(y), self.pos(r)]] {
+                    if !Self::sub_ok(po, pn, side) {
+                        return None;
+                    }
+                }
+                plan.push((fi, x, y, r));
+            }
+            let m = self.add_vertex(p);
+            for (fi, x, y, r) in plan {
+                self.set_face(fi, [x, m, r]);
+                self.push_face([m, y, r]);
+            }
+            Some(m)
+        }
+
+        fn try_split_face(&mut self, fi: u32, p: [f64; 3]) -> bool {
+            if self.near_vertex(p) {
+                return false;
+            }
+            let p = p.map(|x| x as f32 as f64);
+            let [a, b, c] = self.tris[fi as usize];
+            let po = [a, b, c].map(|i| self.pos(i));
+            for pn in [[po[0], po[1], p], [po[1], po[2], p], [po[2], po[0], p]] {
+                if !Self::sub_ok(po, pn, None) {
+                    return false;
+                }
+            }
+            let m = self.add_vertex(p);
+            self.set_face(fi, [a, b, m]);
+            self.push_face([b, c, m]);
+            self.push_face([c, a, m]);
+            true
+        }
+
+        fn insert_corner(&mut self, c: [f64; 3], r_cut: f64) -> bool {
+            if self.near_vertex(c) {
+                return false;
+            }
+            let mut best: Option<(f64, u32, [f64; 3])> = None;
+            for (fi, t) in self.tris.iter().enumerate() {
+                let p = t.map(|i| g64(self.verts[i as usize]));
+                let lo = [0, 1, 2].map(|k| p[0][k].min(p[1][k]).min(p[2][k]) - r_cut);
+                let hi = [0, 1, 2].map(|k| p[0][k].max(p[1][k]).max(p[2][k]) + r_cut);
+                if (0..3).any(|k| c[k] < lo[k] || c[k] > hi[k]) {
+                    continue;
+                }
+                let (q, bc) = closest_on_triangle(c, p);
+                let d = len(sub(q, c));
+                if best.is_none_or(|(bd, _, _)| d < bd) {
+                    best = Some((d, fi as u32, bc));
+                }
+            }
+            let Some((d, fi, bc)) = best else { return false };
+            if d > r_cut {
+                return false;
+            }
+            let t = self.tris[fi as usize];
+            let small: Vec<usize> = (0..3).filter(|&k| bc[k] < 0.02).collect();
+            match small.as_slice() {
+                [k] => self.try_split_edge(t[(k + 1) % 3], t[(k + 2) % 3], c, None).is_some(),
+                [] => self.try_split_face(fi, c),
+                _ => false,
+            }
+        }
+
+        /// 沿一段源折痕切边,返回分裂次数。
+        fn cut_along(&mut self, [a0, b0]: [[f64; 3]; 2], normals: [[f64; 3]; 2], r_cut: f64) -> usize {
+            let g = sub(normals[0], normals[1]);
+            if len(g) < 1e-6 {
+                return 0;
+            }
+            let ab = sub(b0, a0);
+            let ab2 = dot3(ab, ab);
+            if ab2 <= 0.0 {
+                return 0;
+            }
+            let seg = |p: [f64; 3]| -> ([f64; 3], f64) {
+                let t = dot3(sub(p, a0), ab) / ab2;
+                (add(a0, scale(ab, t.clamp(0.0, 1.0))), t)
+            };
+            let lo = [0, 1, 2].map(|k| a0[k].min(b0[k]) - 2.0 * r_cut);
+            let hi = [0, 1, 2].map(|k| a0[k].max(b0[k]) + 2.0 * r_cut);
+            let inside = |p: [f64; 3]| (0..3).all(|k| p[k] >= lo[k] && p[k] <= hi[k]);
+            let mut rejected: std::collections::HashSet<u64, FxBuild> = Default::default();
+            let mut n = 0usize;
+            'scan: for _ in 0..10_000 {
+                for fi in 0..self.tris.len() {
+                    let t = self.tris[fi];
+                    if !t.iter().any(|&v| inside(self.pos(v))) {
+                        continue;
+                    }
+                    for k in 0..3 {
+                        let (a, b) = (t[k], t[(k + 1) % 3]);
+                        let key = spur_edge_key(a, b);
+                        if rejected.contains(&key) {
+                            continue;
+                        }
+                        let (pa, pb) = (self.pos(a), self.pos(b));
+                        let (sa, sb) = (dot3(sub(pa, a0), g), dot3(sub(pb, a0), g));
+                        if sa * sb >= 0.0 {
+                            continue;
+                        }
+                        if len(sub(seg(pa).0, pa)) < self.on_tol || len(sub(seg(pb).0, pb)) < self.on_tol {
+                            continue;
+                        }
+                        let x = add(pa, scale(sub(pb, pa), sa / (sa - sb)));
+                        let (q, tr) = seg(x);
+                        if len(sub(x, q)) > r_cut || !(-0.02..=1.02).contains(&tr) {
+                            continue;
+                        }
+                        if self.try_split_edge(a, b, q, Some(normals)).is_some() {
+                            n += 1;
+                            continue 'scan;
+                        }
+                        rejected.insert(key);
+                    }
+                }
+                break;
+            }
+            n
+        }
+    }
+
+    /// 点到三角形的最近点及其重心坐标(Ericson《Real-Time Collision Detection》5.1.5)。
+    fn closest_on_triangle(p: [f64; 3], t: [[f64; 3]; 3]) -> ([f64; 3], [f64; 3]) {
+        let [a, b, c] = t;
+        let (ab, ac, ap) = (sub(b, a), sub(c, a), sub(p, a));
+        let (d1, d2) = (dot3(ab, ap), dot3(ac, ap));
+        if d1 <= 0.0 && d2 <= 0.0 {
+            return (a, [1.0, 0.0, 0.0]);
+        }
+        let bp = sub(p, b);
+        let (d3, d4) = (dot3(ab, bp), dot3(ac, bp));
+        if d3 >= 0.0 && d4 <= d3 {
+            return (b, [0.0, 1.0, 0.0]);
+        }
+        let vc = d1 * d4 - d3 * d2;
+        if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+            let v = d1 / (d1 - d3);
+            return (add(a, scale(ab, v)), [1.0 - v, v, 0.0]);
+        }
+        let cp = sub(p, c);
+        let (d5, d6) = (dot3(ab, cp), dot3(ac, cp));
+        if d6 >= 0.0 && d5 <= d6 {
+            return (c, [0.0, 0.0, 1.0]);
+        }
+        let vb = d5 * d2 - d1 * d6;
+        if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+            let w = d2 / (d2 - d6);
+            return (add(a, scale(ac, w)), [1.0 - w, 0.0, w]);
+        }
+        let va = d3 * d6 - d5 * d4;
+        if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+            let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+            return (add(b, scale(sub(c, b), w)), [0.0, 1.0 - w, w]);
+        }
+        let den = 1.0 / (va + vb + vc);
+        let (v, w) = (vb * den, vc * den);
+        (add(add(a, scale(ab, v)), scale(ac, w)), [1.0 - v - w, v, w])
+    }
+
+    /// P33:一条共享边的视觉代价 max(0, 输出二面角 − 源二面角 − 15°),只计输出二面角 > 20° 的边。
+    /// 源二面角取两侧各一个贴边采样点(边中点向面质心走 30%)处最近源面的法线夹角;退化面计 30。
+    fn visual_excess(reference: &meshfield::MeshField, p1: [[f64; 3]; 3], p2: [[f64; 3]; 3], pa: [f64; 3], pb: [f64; 3]) -> f64 {
+        let (n1, n2) = (spur_normal(p1), spur_normal(p2));
+        let (l1, l2) = (len(n1), len(n2));
+        if l1 < 1e-14 || l2 < 1e-14 {
+            return 30.0;
+        }
+        let dev = (dot3(n1, n2) / (l1 * l2)).clamp(-1.0, 1.0).acos().to_degrees();
+        if dev <= 20.0 {
+            return 0.0;
+        }
+        let mid = scale(add(pa, pb), 0.5);
+        let probe = |p: [[f64; 3]; 3]| {
+            let c = scale(add(add(p[0], p[1]), p[2]), 1.0 / 3.0);
+            let (_, t, _, _) = reference.closest_features(add(mid, scale(sub(c, mid), 0.3)));
+            reference.face_normal(t)
+        };
+        let sdev = dot3(probe(p1), probe(p2)).clamp(-1.0, 1.0).acos().to_degrees();
+        (dev - sdev - 15.0).max(0.0)
+    }
+
+    /// P33:面法线与质心处最近源面法线的夹角(度);退化面 180。
+    fn face_source_error(reference: &meshfield::MeshField, p: [[f64; 3]; 3]) -> f64 {
+        let n = spur_normal(p);
+        let l = len(n);
+        if l < 1e-14 {
+            return 180.0;
+        }
+        let c = scale(add(add(p[0], p[1]), p[2]), 1.0 / 3.0);
+        let (_, t, _, _) = reference.closest_features(c);
+        (dot3(n, reference.face_normal(t)) / l).clamp(-1.0, 1.0).acos().to_degrees()
+    }
+
+    /// P33:面上 7 个采样点(3 顶点、质心、3 边中点)到源面的最大距离。
+    fn ref_face_max_distance(reference: &meshfield::MeshField, p: [[f64; 3]; 3]) -> f64 {
+        let c = scale(add(add(p[0], p[1]), p[2]), 1.0 / 3.0);
+        [p[0], p[1], p[2], c, scale(add(p[0], p[1]), 0.5), scale(add(p[1], p[2]), 0.5), scale(add(p[2], p[0]), 0.5)]
+            .into_iter()
+            .map(|s| reference.closest_features(s).0)
+            .fold(0.0, f64::max)
+    }
+
+    /// 一个面由 `po` 变成 `pn` 是否可接受:不退化;不成为薄片(除非旧面更差);
+    /// 旧面非薄片时转角 ≤ 60°。
+    fn spur_replace_ok(po: [[f64; 3]; 3], pn: [[f64; 3]; 3], min_quality: f64) -> bool {
+        let (no, nn) = (spur_normal(po), spur_normal(pn));
+        let (lo, ln) = (len(no), len(nn));
+        if ln < 1e-12 {
+            return false;
+        }
+        let (qo, qn) = (spur_quality(po), spur_quality(pn));
+        let (ho, hn) = (spur_height(po), spur_height(pn));
+        if (qn < min_quality && qn < qo) || (hn < SPUR_SLIVER_H && hn < ho) {
+            return false;
+        }
+        !(qo > 0.02 && dot3(no, nn) < 0.5 * lo * ln)
+    }
+
     impl Mesh {
         /// STL encodes coordinates without vertex indices. Two used vertex IDs at
         /// the same f32 position will falsely meet when the exported STL is read.
@@ -2453,6 +2979,1043 @@ pub mod nets {
                 if fan.is_empty() { None } else { grid.target(g64(p), &fan, radius) }
             }).collect()
         }
+
+        /// **折痕毛刺清理(P26/P27)**:折痕约束路径收尾后,原始折痕线上相邻的两个顶点
+        /// 之间常夹着一个"半吸附"顶点 —— `fit_reference` 把它往折痕拉时,验收发现会压扁
+        /// 邻面,步长减半后停在离折痕约 0.03mm 处。它和折痕上的邻点组成 ~0.09mm 长、
+        /// 二面角 ~120° 的短边,查看器把它画成主棱线旁的小毛刺;连续几个就是"阶梯";
+        /// 折痕边本身缺失(被一条斜跨的边代替)时则显示为棱线旁一段平行短线。
+        ///
+        /// 每轮三步(共 `rounds` 轮),都只动锐边(二面角 > `sharp_deg`)顶点及其 1 环:
+        /// 1. **翻边恢复折痕边**:四边形两个对顶点都在源折痕上、且其连线沿折痕时,把斜跨的
+        ///    对角线翻成折痕边(新面须与该处源折痕两侧法线之一同向 ≥ 0.9、不成薄片);
+        /// 2. **塌缩**:离折痕 `on_tol..off_max` 的顶点沿边并到已在折痕上、边长 ≤ `max_len`
+        ///    的邻点(共享面恰 2 + 链接条件、存留面不退化/不翻转/不成薄片);
+        /// 3. **吸附**:仍剩下的顶点直接移到折痕上的最近点(同样的形状与翻转守卫,且新面
+        ///    与源法线的一致度不得变差)。
+        ///
+        /// 薄片 = 归一化质量 2A/e²max < `min_quality` 或最小高度 < 0.01mm;新面只有在旧面本来
+        /// 更差时才允许低于阈值。返回 (翻边数, 塌缩数, 吸附数)。
+        ///
+        /// Python 原型实测(叶轮 h=0.1 mult=1,>30° 锐边):毛刺 1,563 → 202、阶梯 497 → 72、
+        /// 非流形 22 → 11、薄片 123 → 117、真缺陷折叠 16 → 14(P26 只塌缩时为 410 / 149)。
+        pub fn merge_crease_spurs(
+            &mut self,
+            grid: &ReferenceCreases,
+            sharp_deg: f64,
+            on_tol: Real,
+            off_max: Real,
+            max_len: Real,
+            min_quality: f64,
+            rounds: usize,
+        ) -> (usize, usize, usize) {
+            let (mut nf, mut nc, mut nm) = (0, 0, 0);
+            for _ in 0..rounds {
+                let f = self.flip_onto_creases(grid, sharp_deg, on_tol, min_quality);
+                let c = self.collapse_onto_creases(grid, sharp_deg, on_tol, off_max, max_len, min_quality);
+                let m = self.move_onto_creases(grid, sharp_deg, on_tol, off_max, min_quality);
+                nf += f;
+                nc += c;
+                nm += m;
+                if f + c + m == 0 {
+                    break;
+                }
+            }
+            (nf, nc, nm)
+        }
+
+        /// 锐边(二面角 > `sharp_deg`)两端顶点及其 1 环。
+        fn sharp_band(&self, sharp_deg: f64) -> Vec<bool> {
+            let nv = self.verts.len();
+            let mut emap: std::collections::HashMap<u64, [u32; 3], FxBuild> =
+                std::collections::HashMap::with_capacity_and_hasher(self.tris.len() * 3, FxBuild);
+            for (ti, t) in self.tris.iter().enumerate() {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let e = emap.entry(spur_edge_key(a, b)).or_insert([u32::MAX, u32::MAX, 0]);
+                    if e[0] == u32::MAX {
+                        e[0] = ti as u32;
+                    } else if e[1] == u32::MAX {
+                        e[1] = ti as u32;
+                    }
+                    e[2] += 1;
+                }
+            }
+            let cos_sharp = sharp_deg.to_radians().cos();
+            let mut core = vec![false; nv];
+            for (key, e) in emap.iter() {
+                if e[2] != 2 {
+                    continue;
+                }
+                let n0 = spur_normal(self.tris[e[0] as usize].map(|i| g64(self.verts[i as usize])));
+                let n1 = spur_normal(self.tris[e[1] as usize].map(|i| g64(self.verts[i as usize])));
+                let (l0, l1) = (len(n0), len(n1));
+                if l0 > 0.0 && l1 > 0.0 && dot3(n0, n1) < cos_sharp * l0 * l1 {
+                    core[(key >> 32) as usize] = true;
+                    core[(key & 0xffff_ffff) as usize] = true;
+                }
+            }
+            let mut band = core.clone();
+            for t in &self.tris {
+                if t.iter().any(|&i| core[i as usize]) {
+                    for &i in t {
+                        band[i as usize] = true;
+                    }
+                }
+            }
+            band
+        }
+
+        /// 第 1 步:翻边恢复缺失的折痕边。
+        fn flip_onto_creases(&mut self, grid: &ReferenceCreases, sharp_deg: f64, on_tol: Real, min_quality: f64) -> usize {
+            let band = self.sharp_band(sharp_deg);
+            let on: Vec<bool> = (0..self.verts.len())
+                .map(|v| band[v] && grid.distance(g64(self.verts[v])).is_some_and(|d| d < on_tol))
+                .collect();
+            let mut emap: std::collections::HashMap<u64, [u32; 3], FxBuild> =
+                std::collections::HashMap::with_capacity_and_hasher(self.tris.len() * 3, FxBuild);
+            for (ti, t) in self.tris.iter().enumerate() {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let e = emap.entry(spur_edge_key(a, b)).or_insert([u32::MAX, u32::MAX, 0]);
+                    if e[0] == u32::MAX {
+                        e[0] = ti as u32;
+                    } else if e[1] == u32::MAX {
+                        e[1] = ti as u32;
+                    }
+                    e[2] += 1;
+                }
+            }
+            let mut keys: Vec<u64> = emap
+                .iter()
+                .filter(|(k, e)| e[2] == 2 && (band[(*k >> 32) as usize] || band[(*k & 0xffff_ffff) as usize]))
+                .map(|(k, _)| *k)
+                .collect();
+            keys.sort_unstable();
+            let on_crease = |p: [Real; 3]| grid.distance(p).is_some_and(|d| d < on_tol);
+            let mut used = vec![false; self.tris.len()];
+            let mut n = 0usize;
+            for key in keys {
+                let Some(e) = emap.get(&key).copied() else { continue };
+                if e[2] != 2 {
+                    continue;
+                }
+                let (f1, f2) = (e[0], e[1]);
+                if used[f1 as usize] || used[f2 as usize] {
+                    continue;
+                }
+                let (mut w, mut x) = ((key >> 32) as u32, (key & 0xffff_ffff) as u32);
+                // f1 须含有向边 w→x(两面绕向一致时 f2 含 x→w)
+                let t1o = self.tris[f1 as usize];
+                let i = t1o.iter().position(|&v| v == w).unwrap();
+                if t1o[(i + 1) % 3] != x {
+                    std::mem::swap(&mut w, &mut x);
+                }
+                let opp = |t: [u32; 3]| *t.iter().find(|&&v| v != w && v != x).unwrap();
+                let (a, b) = (opp(self.tris[f1 as usize]), opp(self.tris[f2 as usize]));
+                if a == b || !on[a as usize] || !on[b as usize] || emap.contains_key(&spur_edge_key(a, b)) {
+                    continue;
+                }
+                let (pw, px, pa, pb) = (
+                    g64(self.verts[w as usize]),
+                    g64(self.verts[x as usize]),
+                    g64(self.verts[a as usize]),
+                    g64(self.verts[b as usize]),
+                );
+                if on_crease(scale(add(pw, px), 0.5)) {
+                    continue; // w–x 已是折痕边
+                }
+                if ![0.25, 0.5, 0.75].iter().all(|&t| on_crease(add(pa, scale(sub(pb, pa), t)))) {
+                    continue; // a–b 不沿折痕
+                }
+                let (n1, n2) = ([a, w, b], [b, x, a]);
+                let ok = [[pa, pw, pb], [pb, px, pa]].into_iter().all(|p| {
+                    spur_quality(p) >= min_quality && spur_height(p) >= SPUR_SLIVER_H && spur_agree(grid, p) >= 0.9
+                });
+                if !ok {
+                    continue;
+                }
+                self.tris[f1 as usize] = n1;
+                self.tris[f2 as usize] = n2;
+                used[f1 as usize] = true;
+                used[f2 as usize] = true;
+                emap.remove(&key);
+                emap.insert(spur_edge_key(a, b), [f1, f2, 2]);
+                n += 1;
+            }
+            n
+        }
+
+        /// 第 2 步:把折痕旁顶点沿边塌缩到折痕上的邻点。
+        fn collapse_onto_creases(
+            &mut self,
+            grid: &ReferenceCreases,
+            sharp_deg: f64,
+            on_tol: Real,
+            off_max: Real,
+            max_len: Real,
+            min_quality: f64,
+        ) -> usize {
+            let nv = self.verts.len();
+            let nt = self.tris.len();
+            if nv == 0 || nt == 0 {
+                return 0;
+            }
+            let band = self.sharp_band(sharp_deg);
+            let dist: Vec<Real> = (0..nv)
+                .map(|v| if band[v] { grid.distance(g64(self.verts[v])).unwrap_or(Real::INFINITY) } else { Real::INFINITY })
+                .collect();
+            let mut order: Vec<u32> = (0..nv as u32)
+                .filter(|&v| dist[v as usize] >= on_tol && dist[v as usize] < off_max)
+                .collect();
+            order.sort_by(|a, b| dist[*a as usize].total_cmp(&dist[*b as usize]).then(a.cmp(b)));
+            let mut v2t: Vec<Vec<u32>> = vec![Vec::new(); nv];
+            for (ti, t) in self.tris.iter().enumerate() {
+                for &v in t {
+                    v2t[v as usize].push(ti as u32);
+                }
+            }
+            let mut dead = vec![false; nt];
+            let nbrs_of = |v2t: &[Vec<u32>], tris: &[[u32; 3]], v: u32| -> Vec<u32> {
+                let mut s: Vec<u32> = Vec::with_capacity(8);
+                for &ti in &v2t[v as usize] {
+                    for &x in &tris[ti as usize] {
+                        if x != v && !s.contains(&x) {
+                            s.push(x);
+                        }
+                    }
+                }
+                s
+            };
+            let mut n_collapsed = 0usize;
+            for &w in &order {
+                if v2t[w as usize].is_empty() {
+                    continue;
+                }
+                let pw = g64(self.verts[w as usize]);
+                let nw = nbrs_of(&v2t, &self.tris, w);
+                let mut ons: Vec<(Real, u32)> = nw
+                    .iter()
+                    .filter(|&&u| dist[u as usize] < on_tol)
+                    .map(|&u| (len(sub(g64(self.verts[u as usize]), pw)), u))
+                    .filter(|&(l, _)| l <= max_len)
+                    .collect();
+                ons.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                'cand: for &(_, u) in &ons {
+                    let shared: Vec<u32> = v2t[w as usize]
+                        .iter()
+                        .copied()
+                        .filter(|&ti| self.tris[ti as usize].contains(&u))
+                        .collect();
+                    if shared.len() != 2 {
+                        continue;
+                    }
+                    let opp = |ti: u32| -> u32 { *self.tris[ti as usize].iter().find(|&&x| x != u && x != w).unwrap() };
+                    let want = [opp(shared[0]), opp(shared[1])];
+                    let nu = nbrs_of(&v2t, &self.tris, u);
+                    let common: Vec<u32> = nw.iter().copied().filter(|x| nu.contains(x)).collect();
+                    if common.len() != 2 || !common.contains(&want[0]) || !common.contains(&want[1]) {
+                        continue;
+                    }
+                    let pu = g64(self.verts[u as usize]);
+                    for &ti in &v2t[w as usize] {
+                        if shared.contains(&ti) {
+                            continue;
+                        }
+                        let t = self.tris[ti as usize];
+                        let po = t.map(|i| g64(self.verts[i as usize]));
+                        let pn = t.map(|i| if i == w { pu } else { g64(self.verts[i as usize]) });
+                        if !spur_replace_ok(po, pn, min_quality) {
+                            continue 'cand;
+                        }
+                    }
+                    for &ti in &shared {
+                        dead[ti as usize] = true;
+                        for x in self.tris[ti as usize] {
+                            v2t[x as usize].retain(|&y| y != ti);
+                        }
+                    }
+                    let moved = std::mem::take(&mut v2t[w as usize]);
+                    for ti in moved {
+                        for x in self.tris[ti as usize].iter_mut() {
+                            if *x == w {
+                                *x = u;
+                            }
+                        }
+                        v2t[u as usize].push(ti);
+                    }
+                    n_collapsed += 1;
+                    break;
+                }
+            }
+            if n_collapsed > 0 {
+                let mut remap = vec![u32::MAX; nv];
+                let mut verts = Vec::with_capacity(nv);
+                let mut tris = Vec::with_capacity(nt);
+                for (ti, t) in self.tris.iter().enumerate() {
+                    if dead[ti] {
+                        continue;
+                    }
+                    tris.push(t.map(|i| {
+                        if remap[i as usize] == u32::MAX {
+                            remap[i as usize] = verts.len() as u32;
+                            verts.push(self.verts[i as usize]);
+                        }
+                        remap[i as usize]
+                    }));
+                }
+                self.verts = verts;
+                self.tris = tris;
+            }
+            n_collapsed
+        }
+
+        /// 第 3 步:剩下的折痕旁顶点直接移到折痕最近点。
+        fn move_onto_creases(
+            &mut self,
+            grid: &ReferenceCreases,
+            sharp_deg: f64,
+            on_tol: Real,
+            off_max: Real,
+            min_quality: f64,
+        ) -> usize {
+            let nv = self.verts.len();
+            let band = self.sharp_band(sharp_deg);
+            let mut v2t: Vec<Vec<u32>> = vec![Vec::new(); nv];
+            for (ti, t) in self.tris.iter().enumerate() {
+                for &v in t {
+                    v2t[v as usize].push(ti as u32);
+                }
+            }
+            let mut n = 0usize;
+            for w in 0..nv {
+                if !band[w] || v2t[w].is_empty() {
+                    continue;
+                }
+                let Some((d, q, _)) = grid.nearest(g64(self.verts[w])) else { continue };
+                if !(d >= on_tol && d < off_max) {
+                    continue;
+                }
+                let qf = q.map(|v| v as f32 as f64);
+                let ok = v2t[w].iter().all(|&ti| {
+                    let t = self.tris[ti as usize];
+                    let po = t.map(|i| g64(self.verts[i as usize]));
+                    let pn = t.map(|i| if i as usize == w { qf } else { g64(self.verts[i as usize]) });
+                    if !spur_replace_ok(po, pn, min_quality) {
+                        return false;
+                    }
+                    let ag = spur_agree(grid, pn);
+                    ag >= 0.9 || ag >= spur_agree(grid, po)
+                });
+                if ok {
+                    self.verts[w] = qf.map(|v| v as f32);
+                    n += 1;
+                }
+            }
+            n
+        }
+
+        /// **按源网格复核修补(P28)**:折痕约束路径的最后一步。前面各步都只看"顶点在不在
+        /// 源面/折痕上",而放大后看到的残余瑕疵是**面**的问题:三个顶点都在源面上,面却斜跨
+        /// 折痕(法线介于两侧之间)、退化成折痕上的一条线、或成为偏离源面的小鳍片。
+        ///
+        /// 判据(`ref_face_cost`):面上 7 个采样点(3 顶点、质心、3 边中点)到源面的最大距离
+        /// > 0.02mm(QEM err2=1e-4 的弦高本身约 0.01mm,不算),或质心处法线与源面/源折痕两侧
+        /// 法线的最大一致度 < 0.8(偏 > 37°),或退化。只扫锐边带(`sharp_band`)上的面。
+        ///
+        /// 每轮:①对缺陷面逐边试**翻边**(新两面代价更低且不同时为缺陷);②对仍是缺陷的面逐边
+        /// 试**塌缩**(两方向,链接条件、不翻转、不新造薄片,且邻域缺陷数不增、代价严格下降)。
+        /// 返回 (修前缺陷面数, 翻边数, 塌缩数, 修后缺陷面数)。
+        ///
+        /// Python 原型实测(叶轮 h=0.1 mult=1,在当前 Rust 输出上):可见缺陷面 129 → 7,
+        /// 真缺陷折叠 15 → 0,阶梯 85 → 20,薄片 82 → 72,非流形 22 → 13,输出→原始 max ≤ 0.01mm。
+        pub fn repair_reference_defects(
+            &mut self,
+            reference: &meshfield::MeshField,
+            grid: &ReferenceCreases,
+            sharp_deg: f64,
+            rounds: usize,
+        ) -> (usize, usize, usize, usize) {
+            let before = self.reference_bad_faces(reference, grid, sharp_deg).len();
+            let (mut nf, mut nc) = (0usize, 0usize);
+            let mut after = before;
+            for _ in 0..rounds {
+                if after == 0 {
+                    break;
+                }
+                let bad = self.reference_bad_faces(reference, grid, sharp_deg);
+                let f = self.flip_reference_defects(reference, grid, &bad);
+                let bad = self.reference_bad_faces(reference, grid, sharp_deg);
+                let c = self.collapse_reference_defects(reference, grid, &bad);
+                nf += f;
+                nc += c;
+                after = self.reference_bad_faces(reference, grid, sharp_deg).len();
+                if f + c == 0 {
+                    break;
+                }
+            }
+            (before, nf, nc, after)
+        }
+
+        /// 锐边带上的缺陷面(并行扫描,结果按面号升序,与线程数无关)。
+        fn reference_bad_faces(&self, reference: &meshfield::MeshField, grid: &ReferenceCreases, sharp_deg: f64) -> Vec<u32> {
+            let band = self.sharp_band(sharp_deg);
+            let cand: Vec<u32> = (0..self.tris.len() as u32)
+                .filter(|&t| self.tris[t as usize].iter().any(|&v| band[v as usize]))
+                .collect();
+            if cand.is_empty() {
+                return Vec::new();
+            }
+            let chunk = cand.len().div_ceil(nthreads()).max(1);
+            let parts: Vec<Vec<u32>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = cand
+                    .chunks(chunk)
+                    .map(|part| {
+                        scope.spawn(move || {
+                            part.iter()
+                                .copied()
+                                .filter(|&t| {
+                                    let p = self.tris[t as usize].map(|i| g64(self.verts[i as usize]));
+                                    ref_face_cost(reference, grid, p).0
+                                })
+                                .collect::<Vec<u32>>()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().expect("缺陷扫描线程 panic")).collect()
+            });
+            parts.concat()
+        }
+
+        /// 第 ① 步:缺陷面逐边试翻边。
+        fn flip_reference_defects(&mut self, reference: &meshfield::MeshField, grid: &ReferenceCreases, bad: &[u32]) -> usize {
+            let nt = self.tris.len();
+            let mut emap: std::collections::HashMap<u64, [u32; 3], FxBuild> =
+                std::collections::HashMap::with_capacity_and_hasher(nt * 3, FxBuild);
+            for (ti, t) in self.tris.iter().enumerate() {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let e = emap.entry(spur_edge_key(a, b)).or_insert([u32::MAX, u32::MAX, 0]);
+                    if e[0] == u32::MAX {
+                        e[0] = ti as u32;
+                    } else if e[1] == u32::MAX {
+                        e[1] = ti as u32;
+                    }
+                    e[2] += 1;
+                }
+            }
+            let mut used = vec![false; nt];
+            let mut n = 0usize;
+            for &fi in bad {
+                if used[fi as usize] {
+                    continue;
+                }
+                let t = self.tris[fi as usize];
+                let (bad0, c0) = ref_face_cost(reference, grid, t.map(|i| g64(self.verts[i as usize])));
+                if !bad0 {
+                    continue;
+                }
+                for k in 0..3 {
+                    let (w, x, a) = (t[k], t[(k + 1) % 3], t[(k + 2) % 3]);
+                    let Some(e) = emap.get(&spur_edge_key(w, x)).copied() else { continue };
+                    if e[2] != 2 {
+                        continue;
+                    }
+                    let f2 = if e[0] == fi { e[1] } else { e[0] };
+                    if f2 == fi || used[f2 as usize] {
+                        continue;
+                    }
+                    let Some(&b) = self.tris[f2 as usize].iter().find(|&&v| v != w && v != x) else { continue };
+                    if a == b || emap.contains_key(&spur_edge_key(a, b)) {
+                        continue;
+                    }
+                    let (t1, t2) = ([a, w, b], [b, x, a]);
+                    let p1 = t1.map(|i| g64(self.verts[i as usize]));
+                    let p2 = t2.map(|i| g64(self.verts[i as usize]));
+                    if spur_quality(p1).min(spur_quality(p2)) < 1e-3 {
+                        continue;
+                    }
+                    let old = c0 + ref_face_cost(reference, grid, self.tris[f2 as usize].map(|i| g64(self.verts[i as usize]))).1;
+                    let (b1, c1) = ref_face_cost(reference, grid, p1);
+                    let (b2, c2) = ref_face_cost(reference, grid, p2);
+                    if c1 + c2 < old - 1e-6 && !(b1 && b2) {
+                        self.tris[fi as usize] = t1;
+                        self.tris[f2 as usize] = t2;
+                        used[fi as usize] = true;
+                        used[f2 as usize] = true;
+                        emap.remove(&spur_edge_key(w, x));
+                        emap.insert(spur_edge_key(a, b), [fi, f2, 2]);
+                        n += 1;
+                        break;
+                    }
+                }
+            }
+            n
+        }
+
+        /// 第 ② 步:缺陷面逐边试塌缩(短边优先,两方向)。
+        fn collapse_reference_defects(&mut self, reference: &meshfield::MeshField, grid: &ReferenceCreases, bad: &[u32]) -> usize {
+            let nv = self.verts.len();
+            let nt = self.tris.len();
+            let mut v2t: Vec<Vec<u32>> = vec![Vec::new(); nv];
+            for (ti, t) in self.tris.iter().enumerate() {
+                for &v in t {
+                    v2t[v as usize].push(ti as u32);
+                }
+            }
+            let nbrs_of = |v2t: &[Vec<u32>], tris: &[[u32; 3]], v: u32| -> Vec<u32> {
+                let mut s: Vec<u32> = Vec::with_capacity(8);
+                for &ti in &v2t[v as usize] {
+                    for &x in &tris[ti as usize] {
+                        if x != v && !s.contains(&x) {
+                            s.push(x);
+                        }
+                    }
+                }
+                s
+            };
+            let mut dead = vec![false; nt];
+            let mut n = 0usize;
+            for &fi in bad {
+                if dead[fi as usize] {
+                    continue;
+                }
+                let t = self.tris[fi as usize];
+                if !ref_face_cost(reference, grid, t.map(|i| g64(self.verts[i as usize]))).0 {
+                    continue;
+                }
+                let mut edges = [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])];
+                let elen = |e: (u32, u32), verts: &[[f32; 3]]| len(sub(g64(verts[e.0 as usize]), g64(verts[e.1 as usize])));
+                edges.sort_by(|p, q| elen(*p, &self.verts).total_cmp(&elen(*q, &self.verts)));
+                'edge: for (a, b) in edges {
+                    'dir: for (w, u) in [(a, b), (b, a)] {
+                        let shared: Vec<u32> = v2t[w as usize]
+                            .iter()
+                            .copied()
+                            .filter(|&ti| self.tris[ti as usize].contains(&u))
+                            .collect();
+                        if shared.len() != 2 {
+                            continue 'dir;
+                        }
+                        let opp = |ti: u32| -> u32 { *self.tris[ti as usize].iter().find(|&&x| x != u && x != w).unwrap() };
+                        let want = [opp(shared[0]), opp(shared[1])];
+                        let nw = nbrs_of(&v2t, &self.tris, w);
+                        let nu = nbrs_of(&v2t, &self.tris, u);
+                        let common: Vec<u32> = nw.iter().copied().filter(|x| nu.contains(x)).collect();
+                        if common.len() != 2 || !common.contains(&want[0]) || !common.contains(&want[1]) {
+                            continue 'dir;
+                        }
+                        let mut aff: Vec<u32> = v2t[w as usize].clone();
+                        for &ti in &v2t[u as usize] {
+                            if !aff.contains(&ti) {
+                                aff.push(ti);
+                            }
+                        }
+                        let pu = g64(self.verts[u as usize]);
+                        let (mut old_cost, mut old_bad, mut new_cost, mut new_bad) = (0.0f64, 0usize, 0.0f64, 0usize);
+                        for &ti in &aff {
+                            let tt = self.tris[ti as usize];
+                            let po = tt.map(|i| g64(self.verts[i as usize]));
+                            let (bo, co) = ref_face_cost(reference, grid, po);
+                            old_cost += co;
+                            old_bad += bo as usize;
+                            if shared.contains(&ti) {
+                                continue;
+                            }
+                            let pn = tt.map(|i| if i == w { pu } else { g64(self.verts[i as usize]) });
+                            let (no, nn) = (spur_normal(po), spur_normal(pn));
+                            let (lo, ln) = (len(no), len(nn));
+                            if ln < 1e-12 {
+                                continue 'dir;
+                            }
+                            if spur_quality(po) > 0.02 && dot3(no, nn) < 0.5 * lo * ln {
+                                continue 'dir;
+                            }
+                            let (ho, hn) = (spur_height(po), spur_height(pn));
+                            if hn < SPUR_SLIVER_H && hn < ho && ho >= SPUR_SLIVER_H {
+                                continue 'dir;
+                            }
+                            let (bn, cn) = ref_face_cost(reference, grid, pn);
+                            new_cost += cn;
+                            new_bad += bn as usize;
+                        }
+                        if new_bad > old_bad || new_cost >= old_cost - 1e-6 {
+                            continue 'dir;
+                        }
+                        for &ti in &shared {
+                            dead[ti as usize] = true;
+                            for x in self.tris[ti as usize] {
+                                v2t[x as usize].retain(|&y| y != ti);
+                            }
+                        }
+                        let moved = std::mem::take(&mut v2t[w as usize]);
+                        for ti in moved {
+                            for x in self.tris[ti as usize].iter_mut() {
+                                if *x == w {
+                                    *x = u;
+                                }
+                            }
+                            v2t[u as usize].push(ti);
+                        }
+                        n += 1;
+                        break 'edge;
+                    }
+                }
+            }
+            if n > 0 {
+                self.compact_dead(&dead);
+            }
+            n
+        }
+
+        /// **以源网格为准的二次简化(P29)**:折痕约束路径的收尾。QEM(`decimate_with_creases`)的代价是
+        /// "到累计平面的距离平方之和",平面区每并入一个带 ~0.005mm 提取噪声的面,代价就涨一截,到
+        /// err2 就停 —— 叶轮 48% 的三角落在源网格本身是平面的区域(边长 p50 0.58mm),桌腿 794 个源
+        /// 三角的件输出 34.6 万三角。此时顶点已经投影到源面上,可以直接以源网格为准判误差:
+        ///
+        /// 半边塌缩 w→u,**顶点一律不移动**(u 已在源面上)。
+        /// - 精确判据:u 落在 w 每个存留邻面的平面上(≤ 2e-4mm)⇒ 新面与旧面共面,1 环多边形重新扇形
+        ///   三角化,覆盖区域不变,零附加误差,不采样;
+        /// - 否则对新面按 ≤0.3mm 间距(每边 2–8 段)采样,到源面距离 ≤ `tol`、法线与源面(或折痕两侧)
+        ///   一致度 ≥ 0.95;
+        /// - 折痕顶点(离源折痕 < `on_tol`)只能沿折痕并到相邻折痕顶点(折痕度恰为 2,拐角锁定),
+        ///   新折痕边的 1/4、1/2、3/4 点仍须在折痕上;
+        /// - 守卫:共享面恰 2、链接条件、不翻转(转角 ≤ 60°)、不退化、质量 2A/e²max 不降到 0.01 以下;
+        ///   非流形 / 边界边的端点锁定。短边优先(懒失效堆)。
+        ///
+        /// 返回塌缩次数。Python 原型实测(tol=0.01mm):桌腿 345,750 → 1,554 三角(17.3MB → 78KB,
+        /// 闭合流形,双向 max 0.017mm);叶轮 366,130 → 33,668(18.3MB → 1.7MB,源 STL 7.7MB,
+        /// 输出→源 p99 0.008 / max 0.010mm,真缺陷折叠 2,薄片 35)。
+        pub fn decimate_to_reference(
+            &mut self,
+            reference: &meshfield::MeshField,
+            grid: &ReferenceCreases,
+            tol: Real,
+            on_tol: Real,
+        ) -> usize {
+            const PLANE_EPS: f64 = 2e-4;
+            const AGREE: f64 = 0.95;
+            const QMIN: f64 = 0.01;
+            let nv = self.verts.len();
+            let nt = self.tris.len();
+            if nv == 0 || nt == 0 {
+                return 0;
+            }
+            // 顶点坐标全程不变(只改连接关系)
+            let pos: Vec<[f64; 3]> = self.verts.iter().map(|&v| g64(v)).collect();
+            let on: Vec<bool> = pos.iter().map(|&p| grid.distance(p).is_some_and(|d| d < on_tol)).collect();
+            let on_crease = |p: [f64; 3]| grid.distance(p).is_some_and(|d| d < on_tol);
+            let along_crease = |a: u32, b: u32| -> bool {
+                let (pa, pb) = (pos[a as usize], pos[b as usize]);
+                [0.25, 0.5, 0.75].iter().all(|&t| on_crease(add(pa, scale(sub(pb, pa), t))))
+            };
+            let crease_edge = |a: u32, b: u32| on[a as usize] && on[b as usize] && along_crease(a, b);
+            let elen = |a: u32, b: u32| len(sub(pos[a as usize], pos[b as usize]));
+            let mut ecount: std::collections::HashMap<u64, u32, FxBuild> =
+                std::collections::HashMap::with_capacity_and_hasher(nt * 3, FxBuild);
+            for t in &self.tris {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    *ecount.entry(spur_edge_key(a, b)).or_insert(0) += 1;
+                }
+            }
+            let mut locked = vec![false; nv];
+            for (&k, &c) in &ecount {
+                if c != 2 {
+                    locked[(k >> 32) as usize] = true;
+                    locked[(k & 0xffff_ffff) as usize] = true;
+                }
+            }
+            let mut v2t: Vec<Vec<u32>> = vec![Vec::new(); nv];
+            for (ti, t) in self.tris.iter().enumerate() {
+                for &v in t {
+                    v2t[v as usize].push(ti as u32);
+                }
+            }
+            let nbrs_of = |v2t: &[Vec<u32>], tris: &[[u32; 3]], v: u32| -> Vec<u32> {
+                let mut s: Vec<u32> = Vec::with_capacity(8);
+                for &ti in &v2t[v as usize] {
+                    for &x in &tris[ti as usize] {
+                        if x != v && !s.contains(&x) {
+                            s.push(x);
+                        }
+                    }
+                }
+                s
+            };
+            let mut keys: Vec<u64> = ecount.keys().copied().collect();
+            keys.sort_unstable();
+            let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u32, u32, u32, u32)>> =
+                std::collections::BinaryHeap::with_capacity(keys.len());
+            for k in keys {
+                let (a, b) = ((k >> 32) as u32, (k & 0xffff_ffff) as u32);
+                heap.push(std::cmp::Reverse((elen(a, b).to_bits(), a, b, 0, 0)));
+            }
+            let mut ver = vec![0u32; nv];
+            let mut dead = vec![false; nt];
+            let mut n = 0usize;
+            while let Some(std::cmp::Reverse((_, a, b, va, vb))) = heap.pop() {
+                if ver[a as usize] != va || ver[b as usize] != vb || v2t[a as usize].is_empty() || v2t[b as usize].is_empty() {
+                    continue;
+                }
+                'dir: for (w, u) in [(a, b), (b, a)] {
+                    if locked[w as usize] {
+                        continue;
+                    }
+                    let shared: Vec<u32> = v2t[w as usize]
+                        .iter()
+                        .copied()
+                        .filter(|&ti| self.tris[ti as usize].contains(&u))
+                        .collect();
+                    if shared.len() != 2 {
+                        continue;
+                    }
+                    let opp = |ti: u32| -> u32 { *self.tris[ti as usize].iter().find(|&&x| x != u && x != w).unwrap() };
+                    let want = [opp(shared[0]), opp(shared[1])];
+                    let nw = nbrs_of(&v2t, &self.tris, w);
+                    let nu = nbrs_of(&v2t, &self.tris, u);
+                    let common: Vec<u32> = nw.iter().copied().filter(|x| nu.contains(x)).collect();
+                    if common.len() != 2 || !common.contains(&want[0]) || !common.contains(&want[1]) {
+                        continue;
+                    }
+                    if on[w as usize] {
+                        let cn: Vec<u32> = nw.iter().copied().filter(|&z| crease_edge(w, z)).collect();
+                        if cn.len() != 2 || !cn.contains(&u) {
+                            continue;
+                        }
+                        let z = if cn[0] == u { cn[1] } else { cn[0] };
+                        if !along_crease(u, z) {
+                            continue;
+                        }
+                    }
+                    let pu = pos[u as usize];
+                    for &ti in &v2t[w as usize] {
+                        if shared.contains(&ti) {
+                            continue;
+                        }
+                        let t = self.tris[ti as usize];
+                        let po = t.map(|i| pos[i as usize]);
+                        let pn = t.map(|i| if i == w { pu } else { pos[i as usize] });
+                        let (no, nn) = (spur_normal(po), spur_normal(pn));
+                        let (lo, ln) = (len(no), len(nn));
+                        if ln < 1e-12 || dot3(no, nn) <= 0.5 * lo * ln {
+                            continue 'dir;
+                        }
+                        let (qo, qn) = (spur_quality(po), spur_quality(pn));
+                        if qn < QMIN && qn < qo {
+                            continue 'dir;
+                        }
+                        let exact = (dot3(no, sub(pu, po[0])) / lo).abs() <= PLANE_EPS;
+                        if !exact && !ref_sample_ok(reference, grid, pn, tol, AGREE) {
+                            continue 'dir;
+                        }
+                    }
+                    for &ti in &shared {
+                        dead[ti as usize] = true;
+                        for x in self.tris[ti as usize] {
+                            v2t[x as usize].retain(|&y| y != ti);
+                        }
+                    }
+                    let moved = std::mem::take(&mut v2t[w as usize]);
+                    for ti in moved {
+                        for x in self.tris[ti as usize].iter_mut() {
+                            if *x == w {
+                                *x = u;
+                            }
+                        }
+                        v2t[u as usize].push(ti);
+                    }
+                    ver[u as usize] += 1;
+                    ver[w as usize] += 1;
+                    n += 1;
+                    for z in nbrs_of(&v2t, &self.tris, u) {
+                        heap.push(std::cmp::Reverse((elen(u, z).to_bits(), u, z, ver[u as usize], ver[z as usize])));
+                    }
+                    break 'dir;
+                }
+            }
+            if n > 0 {
+                self.compact_dead(&dead);
+            }
+            n
+        }
+
+        /// **源折痕嵌入(P30)**:把源网格的折痕线"刻"进输出网格。
+        ///
+        /// 前面的步骤只会把顶点吸到**已有**的折痕上;当两条源折痕在一点汇合、两者之间的窄条宽度
+        /// 小于提取格宽 h 时(桌腿:圆柱底边与方板外棱相切,窄条宽 w ≈ z²/60),提取把窄条抹成一个
+        /// 斜坡,两条棱线在切点前约 2mm 就"连"在一起,后处理也无从恢复。这里直接造出缺失的折痕边:
+        ///
+        /// 1. **角点**:源折痕图里度 ≠ 2 的顶点(`ReferenceCreases::corners`)。输出网格里没有顶点离它
+        ///    < `on_tol` 时,在最近点处插入(落在边上分裂该边,否则 1→3 分裂面),坐标取源角点。
+        /// 2. **切边**:对每段源折痕 AB(两侧源面法线 n1, n2),s(x) = (x − A)·(n1 − n2) 在折痕两侧异号。
+        ///    输出边两端异号、都不在折痕上(> `on_tol`)、交点离线段 < `r_cut` 且投影参数在 [−0.02, 1.02]
+        ///    时,在线段上的最近点处分裂该边。依次分裂后,跨折痕的面自然出现沿折痕的边。
+        ///
+        /// 守卫:新顶点不与已有顶点重合(> `on_tol`);边两侧的面都须朝向折痕两侧之一(点积 ≥ 0.5,
+        /// 挡住薄壁另一面);子面不退化、不反向(与原面点积 ≥ 0.2;或与某侧源法线一致 ≥ 0.9 且不反向 ——
+        /// 跨折痕的斜面切开后子面转到两侧源面上,与原斜面可差 90°),非薄片子面须与两侧之一一致 ≥ 0.5。
+        ///
+        /// 返回 (插入角点数, 切边数)。之后应再跑 `merge_crease_spurs` 与 `decimate_to_reference` 收拾切边
+        /// 留下的短边与薄片。Python 原型实测(桌腿 h=0.08 mult=1):源折痕采样点离最近可见锐边
+        /// > 0.05mm 的从 334 降到 0(最大 1.18 → 0.023mm),三角 1,456 → 1,390,仍闭合流形、无折叠。
+        pub fn embed_reference_creases(&mut self, grid: &ReferenceCreases, on_tol: Real, r_cut: Real) -> (usize, usize) {
+            if self.tris.is_empty() {
+                return (0, 0);
+            }
+            let mut e = CreaseEmbed::new(&mut self.verts, &mut self.tris, on_tol);
+            let mut n_corner = 0usize;
+            for c in grid.corners() {
+                if e.insert_corner(c, r_cut) {
+                    n_corner += 1;
+                }
+            }
+            let mut n_cut = 0usize;
+            for &(edge, normals) in grid.segments() {
+                n_cut += e.cut_along(edge, normals, r_cut);
+            }
+            (n_corner, n_cut)
+        }
+
+        /// **视觉毛刺清理(P33)**:查看器会把二面角超过阈值的边画成线。若输出某条边的二面角比源网格
+        /// 同处(两侧各取一个贴边采样点的源面法线夹角)大 15° 以上且 > 20°,它就是一条源件上没有的
+        /// "多余线"。叶轮实测 622 条(> 30° 的 272 条),几乎都在折痕旁,由面积 ~0.001mm²、高 ~0.01mm 的
+        /// 微面(翻面、斜面、薄片)造成 —— 它们离源面都 < 0.02mm,前面各步的距离/法线判据看不出。
+        ///
+        /// 对每条多余线(按超出量从大到小),取两侧面中与源法线偏差更大的那个,按边长从短到长、两个方向
+        /// 试塌缩;接受条件:共享面恰 2 + 链接条件;新面不退化、7 点采样到源面 ≤ 0.02mm;新面不与原面
+        /// 反向(原面本身是薄片或已偏 > 90° 时除外);受影响区域(两端点的 2 环)的视觉代价
+        /// Σ max(0, 输出二面角 − 源二面角 − 15°)(只计 > 20° 的边,退化面计 30)严格下降。
+        ///
+        /// 返回塌缩次数。Python 原型实测(叶轮 h=0.1 mult=1,P32 Rust 输出上 4 轮):多余线 622 → 101、
+        /// 其中 > 30° 的 272 → 9;三角 25,578 → 24,644;非流形 22 → 0;真缺陷折叠 4 → 0;输出→源 p99 0.0087mm。
+        pub fn clean_visual_spurs(&mut self, reference: &meshfield::MeshField, rounds: usize) -> usize {
+            let mut total = 0usize;
+            for _ in 0..rounds {
+                let n = self.clean_visual_spurs_once(reference);
+                total += n;
+                if n == 0 {
+                    break;
+                }
+            }
+            total
+        }
+
+        fn clean_visual_spurs_once(&mut self, reference: &meshfield::MeshField) -> usize {
+            let nv = self.verts.len();
+            let nt = self.tris.len();
+            if nt == 0 {
+                return 0;
+            }
+            let mut v2t: Vec<Vec<u32>> = vec![Vec::new(); nv];
+            for (ti, t) in self.tris.iter().enumerate() {
+                for &v in t {
+                    v2t[v as usize].push(ti as u32);
+                }
+            }
+            let mut emap: std::collections::HashMap<u64, [u32; 3], FxBuild> =
+                std::collections::HashMap::with_capacity_and_hasher(nt * 3, FxBuild);
+            for (ti, t) in self.tris.iter().enumerate() {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let e = emap.entry(spur_edge_key(a, b)).or_insert([u32::MAX, u32::MAX, 0]);
+                    if e[0] == u32::MAX {
+                        e[0] = ti as u32;
+                    } else if e[1] == u32::MAX {
+                        e[1] = ti as u32;
+                    }
+                    e[2] += 1;
+                }
+            }
+            let mut keys: Vec<u64> = emap.iter().filter(|(_, e)| e[2] == 2).map(|(k, _)| *k).collect();
+            keys.sort_unstable();
+            let pos = |verts: &[[f32; 3]], t: [u32; 3]| t.map(|i| g64(verts[i as usize]));
+            let mut cand: Vec<(f64, u32, u32)> = Vec::new();
+            for key in keys {
+                let e = emap[&key];
+                let (a, b) = ((key >> 32) as u32, (key & 0xffff_ffff) as u32);
+                let ex = visual_excess(
+                    reference,
+                    pos(&self.verts, self.tris[e[0] as usize]),
+                    pos(&self.verts, self.tris[e[1] as usize]),
+                    g64(self.verts[a as usize]),
+                    g64(self.verts[b as usize]),
+                );
+                if ex > 0.0 {
+                    cand.push((ex, e[0], e[1]));
+                }
+            }
+            cand.sort_by(|x, y| y.0.total_cmp(&x.0).then(x.1.cmp(&y.1)).then(x.2.cmp(&y.2)));
+            let mut dead = vec![false; nt];
+            let mut n = 0usize;
+            for (_, f1, f2) in cand {
+                if dead[f1 as usize] || dead[f2 as usize] {
+                    continue;
+                }
+                let e1 = face_source_error(reference, pos(&self.verts, self.tris[f1 as usize]));
+                let e2 = face_source_error(reference, pos(&self.verts, self.tris[f2 as usize]));
+                let order = if e1 >= e2 { [f1, f2] } else { [f2, f1] };
+                'face: for fw in order {
+                    if dead[fw as usize] {
+                        continue;
+                    }
+                    let t = self.tris[fw as usize];
+                    let mut edges = [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])];
+                    let elen = |e: (u32, u32), verts: &[[f32; 3]]| len(sub(g64(verts[e.0 as usize]), g64(verts[e.1 as usize])));
+                    edges.sort_by(|p, q| elen(*p, &self.verts).total_cmp(&elen(*q, &self.verts)));
+                    for (x, y) in edges {
+                        for (w, u) in [(x, y), (y, x)] {
+                            if self.try_visual_collapse(reference, &mut v2t, &mut dead, w, u) {
+                                n += 1;
+                                break 'face;
+                            }
+                        }
+                    }
+                }
+            }
+            if n > 0 {
+                self.compact_dead(&dead);
+            }
+            n
+        }
+
+        /// 区域 `faces` 内所有内部边的视觉代价;`over` 给出假想状态下被替换的面。
+        fn local_visual_cost(&self, reference: &meshfield::MeshField, faces: &[u32], over: &[(u32, [u32; 3])]) -> f64 {
+            let get = |f: u32| over.iter().find(|(g, _)| *g == f).map_or(self.tris[f as usize], |x| x.1);
+            let mut edges: std::collections::HashMap<u64, Vec<u32>, FxBuild> = Default::default();
+            for &f in faces {
+                let t = get(f);
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    edges.entry(spur_edge_key(a, b)).or_default().push(f);
+                }
+            }
+            let mut keys: Vec<u64> = edges.keys().copied().collect();
+            keys.sort_unstable();
+            let mut cost = 0.0;
+            for key in keys {
+                let fs = &edges[&key];
+                if fs.len() != 2 {
+                    continue;
+                }
+                let (a, b) = ((key >> 32) as u32, (key & 0xffff_ffff) as u32);
+                let p = |f: u32| get(f).map(|i| g64(self.verts[i as usize]));
+                cost += visual_excess(reference, p(fs[0]), p(fs[1]), g64(self.verts[a as usize]), g64(self.verts[b as usize]));
+            }
+            cost
+        }
+
+        /// 试把 w 并入 u(u 不动)。满足 `clean_visual_spurs` 的全部条件才执行并返回 true。
+        fn try_visual_collapse(
+            &mut self,
+            reference: &meshfield::MeshField,
+            v2t: &mut [Vec<u32>],
+            dead: &mut [bool],
+            w: u32,
+            u: u32,
+        ) -> bool {
+            let shared: Vec<u32> = v2t[w as usize].iter().copied().filter(|&ti| self.tris[ti as usize].contains(&u)).collect();
+            if shared.len() != 2 {
+                return false;
+            }
+            let nbrs_of = |v: u32| -> Vec<u32> {
+                let mut s: Vec<u32> = Vec::with_capacity(8);
+                for &ti in &v2t[v as usize] {
+                    for &x in &self.tris[ti as usize] {
+                        if x != v && !s.contains(&x) {
+                            s.push(x);
+                        }
+                    }
+                }
+                s
+            };
+            let opp = |ti: u32| -> u32 { *self.tris[ti as usize].iter().find(|&&x| x != u && x != w).unwrap() };
+            let want = [opp(shared[0]), opp(shared[1])];
+            let (nw, nu) = (nbrs_of(w), nbrs_of(u));
+            let common: Vec<u32> = nw.iter().copied().filter(|x| nu.contains(x)).collect();
+            if common.len() != 2 || !common.contains(&want[0]) || !common.contains(&want[1]) {
+                return false;
+            }
+            let mut aff: Vec<u32> = v2t[w as usize].clone();
+            for &ti in &v2t[u as usize] {
+                if !aff.contains(&ti) {
+                    aff.push(ti);
+                }
+            }
+            let mut ring: Vec<u32> = Vec::new();
+            for &f in &aff {
+                for &v in &self.tris[f as usize] {
+                    for &g in &v2t[v as usize] {
+                        if !ring.contains(&g) {
+                            ring.push(g);
+                        }
+                    }
+                }
+            }
+            let old = self.local_visual_cost(reference, &ring, &[]);
+            if old <= 0.0 {
+                return false;
+            }
+            let mut over: Vec<(u32, [u32; 3])> = Vec::new();
+            for &f in &v2t[w as usize] {
+                if shared.contains(&f) {
+                    continue;
+                }
+                let t = self.tris[f as usize];
+                let tt = t.map(|i| if i == w { u } else { i });
+                let po = t.map(|i| g64(self.verts[i as usize]));
+                let pn = tt.map(|i| g64(self.verts[i as usize]));
+                let (no, nn) = (spur_normal(po), spur_normal(pn));
+                if len(nn) < 1e-12 {
+                    return false;
+                }
+                if dot3(no, nn) <= 0.0 && !(spur_quality(po) < 0.05 || face_source_error(reference, po) > 90.0) {
+                    return false;
+                }
+                if ref_face_max_distance(reference, pn) > 0.02 {
+                    return false;
+                }
+                over.push((f, tt));
+            }
+            let ring2: Vec<u32> = ring.iter().copied().filter(|f| !shared.contains(f)).collect();
+            let new = self.local_visual_cost(reference, &ring2, &over);
+            if new >= old - 1e-6 {
+                return false;
+            }
+            for &ti in &shared {
+                dead[ti as usize] = true;
+                for x in self.tris[ti as usize] {
+                    v2t[x as usize].retain(|&y| y != ti);
+                }
+            }
+            let moved = std::mem::take(&mut v2t[w as usize]);
+            for ti in moved {
+                for x in self.tris[ti as usize].iter_mut() {
+                    if *x == w {
+                        *x = u;
+                    }
+                }
+                v2t[u as usize].push(ti);
+            }
+            true
+        }
+
+        /// 删除标记为死的三角与由此孤立的顶点(保持其余顶点/三角的相对顺序)。
+        fn compact_dead(&mut self, dead: &[bool]) {
+            let nv = self.verts.len();
+            let mut remap = vec![u32::MAX; nv];
+            let mut verts = Vec::with_capacity(nv);
+            let mut tris = Vec::with_capacity(self.tris.len());
+            for (ti, t) in self.tris.iter().enumerate() {
+                if dead[ti] {
+                    continue;
+                }
+                tris.push(t.map(|i| {
+                    if remap[i as usize] == u32::MAX {
+                        remap[i as usize] = verts.len() as u32;
+                        verts.push(self.verts[i as usize]);
+                    }
+                    remap[i as usize]
+                }));
+            }
+            self.verts = verts;
+            self.tris = tris;
+        }
+
         /// **绕向统一**:从每个三角沿共享边洪泛,凡与已定向邻居"同向穿过同一条边"的
         /// 三角就翻转(交换两个顶点)。最后按有符号体积判整体朝向,必要时整体翻。
         ///
@@ -5972,6 +7535,33 @@ pub mod meshfield {
     }
 
     impl MeshField {
+        /// 源网格场的常驻堆占用(字节,容量口径)。
+        ///
+        /// 用 `capacity()` 而不是 `len()`:Vec 的扩容按 2 倍走,活着占用的是
+        /// 容量;HashMap 另按 hashbrown 的 8/7 装载因子折算桶开销。
+        pub(super) fn mem_bytes(&self) -> usize {
+            use std::mem::size_of;
+            macro_rules! cap {
+                ($v:expr, $t:ty) => {
+                    $v.capacity() * size_of::<$t>()
+                };
+            }
+            let mut b = 0;
+            b += cap!(self.tris, [[Real; 3]; 3]);
+            b += cap!(self.bvh, Bvn);
+            b += cap!(self.order, u32);
+            b += cap!(self.tri_aabb, ([Real; 3], [Real; 3]));
+            b += cap!(self.face_n, [f32; 3]);
+            b += cap!(self.vert_n, [f32; 3]);
+            b += cap!(self.tri_vid, [u32; 3]);
+            // 边法线表:桶数 ≈ capacity·8/7,每桶 = (K,V) + 1 B 控制字节
+            let kv = size_of::<((u32, u32), [f32; 3])>() + 1;
+            b += self.edge_n.capacity() * kv * 8 / 7;
+            let cache = self.cache.lock().map(|c| c.capacity()).unwrap_or(0);
+            b += cache * (size_of::<([u64; 3], f64)>() + 1) * 8 / 7;
+            b + size_of::<Self>()
+        }
+
         /// Two consistently oriented, nondegenerate facets meeting at a sharp edge.
         /// Discard open and multiply incident edges, including coincident sheets.
         pub(super) fn sharp_segments(&self, angle: Real) -> Vec<crate::creases::Segment> {
@@ -6451,6 +8041,11 @@ pub mod meshfield {
         /// best-first 遍历(min-heap 按 AABB 距离²):堆顶距离 ≥ 当前 best 即全局早退;
         /// 子节点按距离近者先入堆;三角形先做自身 AABB 早退再跑精确区域算法。
         /// (VTune 实证:LIFO 无序遍历 + 无三角形早退 → unsigned_distance 272s/90%)
+        /// 第 `t` 个源三角形的单位面法线(`closest_features` 返回的三角形索引)。
+        pub fn face_normal(&self, t: u32) -> [Real; 3] {
+            self.face_n[t as usize].map(Real::from)
+        }
+
         pub fn closest_features(&self, p: [Real; 3]) -> (Real, u32, u8, [Real; 3]) {
             self.closest_features_seeded(p, f64::INFINITY)
         }
@@ -7604,6 +9199,170 @@ mod tests {
         let (hit, _) = mesh.edge_plane([0.5, 0.0, 0.0], 0, 0.0, 1.0).expect("finite edge intersects x=0.8");
         assert!((hit[0] - 0.8).abs() < 1e-10);
         assert!(mesh.edge_plane([0.5, 0.0, 0.0], 0, 0.0, 0.7).is_none());
+    }
+
+    /// P33:平面上一个微斜面(顶点抬起 0.003mm、离邻顶点 0.01mm)造成的 > 20° 多余线应被塌缩掉。
+    #[test]
+    fn visual_spur_cleanup_removes_a_micro_tilted_face() {
+        let source = meshfield::MeshField::new(vec![
+            [[0.,0.,0.], [1.,0.,0.], [1.,1.,0.]],
+            [[0.,0.,0.], [1.,1.,0.], [0.,1.,0.]],
+        ]);
+        // A B C D 方角,O 中心,w 在 O 旁 0.01 处抬起 0.003
+        let mut mesh = nets::Mesh {
+            verts: vec![[0.,0.,0.], [1.,0.,0.], [1.,1.,0.], [0.,1.,0.], [0.5,0.5,0.], [0.5,0.51,0.003]],
+            tris: vec![[0,1,4], [1,2,4], [3,0,4], [2,3,5], [3,4,5], [4,2,5]],
+        };
+        let n = mesh.clean_visual_spurs(&source, 3);
+        assert!(n >= 1, "微斜面应被塌缩");
+        assert_eq!(mesh.tris.len(), 4);
+        for t in &mesh.tris {
+            let [a, b, c] = t.map(|i| mesh.verts[i as usize].map(|x| x as Real));
+            let (u, v) = (sub(b, a), sub(c, a));
+            let nz = u[0] * v[1] - u[1] * v[0];
+            let l = (nz * nz + (u[1] * v[2] - u[2] * v[1]).powi(2) + (u[2] * v[0] - u[0] * v[2]).powi(2)).sqrt();
+            assert!(nz / l > 0.999, "面未贴平:{t:?}");
+        }
+    }
+
+    /// P30:跨 90° 折痕的斜面应被切开,出现沿折痕的边,所有面落到两侧源面上。
+    #[test]
+    fn crease_embedding_cuts_a_ramp_back_into_two_planes() {
+        let source = meshfield::MeshField::new(vec![
+            [[0.,0.,0.], [2.,0.,0.], [0.,1.,0.]],
+            [[0.,0.,0.], [0.,0.,1.], [2.,0.,0.]],
+        ]);
+        let creases = nets::ReferenceCreases::new(&source, 0.4, 35.0);
+        let mut mesh = nets::Mesh {
+            verts: vec![[0.,0.5,0.], [1.,0.5,0.], [0.,0.,0.5], [1.,0.,0.5]],
+            tris: vec![[0,2,1], [1,2,3]],
+        };
+        let (corners, cuts) = mesh.embed_reference_creases(&creases, 0.005, 0.5);
+        assert_eq!(corners, 1, "(0,0,0) 角点应插入,(2,0,0) 太远应跳过");
+        assert!(cuts >= 1, "斜面应被切开");
+        let on_crease = |i: u32| { let p = mesh.verts[i as usize]; p[1].abs() < 1e-6 && p[2].abs() < 1e-6 };
+        assert!(mesh.tris.iter().any(|t| (0..3).any(|k| on_crease(t[k]) && on_crease(t[(k + 1) % 3]))), "应出现沿折痕的边");
+        for t in &mesh.tris {
+            let [a, b, c] = t.map(|i| mesh.verts[i as usize].map(|x| x as Real));
+            let (u, v) = (sub(b, a), sub(c, a));
+            let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+            let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            assert!(n[1] / l > 0.99 || n[2] / l > 0.99, "面未落到源面上或翻转:{t:?} n={n:?}");
+        }
+    }
+
+    /// P29:平面片上的细分网格应被合并,且不移动、不翻转、面积不变。
+    #[test]
+    fn reference_decimation_merges_a_planar_patch_without_moving_it() {
+        let source = meshfield::MeshField::new(vec![
+            [[0.,0.,0.], [1.,0.,0.], [1.,1.,0.]],
+            [[0.,0.,0.], [1.,1.,0.], [0.,1.,0.]],
+        ]);
+        let creases = nets::ReferenceCreases::new(&source, 0.4, 35.0);
+        let mut verts = Vec::new();
+        for j in 0..5 {
+            for i in 0..5 {
+                verts.push([i as f32 * 0.25, j as f32 * 0.25, 0.0]);
+            }
+        }
+        let id = |a: u32, b: u32| b * 5 + a;
+        let mut tris = Vec::new();
+        for j in 0..4u32 {
+            for i in 0..4u32 {
+                tris.push([id(i, j), id(i + 1, j), id(i + 1, j + 1)]);
+                tris.push([id(i, j), id(i + 1, j + 1), id(i, j + 1)]);
+            }
+        }
+        let before: Vec<[f32; 3]> = verts.clone();
+        let mut mesh = nets::Mesh { verts, tris };
+        let n = mesh.decimate_to_reference(&source, &creases, 0.01, 0.005);
+        assert!(n >= 5, "内部顶点应被塌缩,实际 {n}");
+        assert!(mesh.tris.len() <= 24, "三角数 {}", mesh.tris.len());
+        let mut area = 0.0;
+        for t in &mesh.tris {
+            let [a, b, c] = t.map(|i| mesh.verts[i as usize].map(|x| x as Real));
+            let (u, v) = (sub(b, a), sub(c, a));
+            let nz = u[0] * v[1] - u[1] * v[0];
+            let (nx, ny) = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2]);
+            assert!(nz > 0.0 && nx.abs() < 1e-9 && ny.abs() < 1e-9, "面翻转或离开平面");
+            area += nz / 2.0;
+        }
+        assert!((area - 1.0).abs() < 1e-6, "覆盖面积变化:{area}");
+        for p in &mesh.verts {
+            assert!(before.contains(p), "顶点被移动:{p:?}");
+        }
+    }
+
+    /// P28:顶点都在源面上、却斜跨折痕的两面(对角线跨折痕)应被翻成沿折痕的边。
+    #[test]
+    fn reference_repair_flips_a_diagonal_that_straddles_a_crease() {
+        let source = meshfield::MeshField::new(vec![
+            [[0.,0.,0.], [2.,0.,0.], [0.,1.,0.]],
+            [[0.,0.,0.], [0.,0.,1.], [2.,0.,0.]],
+        ]);
+        let creases = nets::ReferenceCreases::new(&source, 0.4, 35.0);
+        // c0, c1 在折痕上;p 在 z=0 面,s 在 y=0 面;对角线 p–s 斜跨折痕
+        let mut mesh = nets::Mesh {
+            verts: vec![[0.,0.,0.], [1.,0.,0.], [0.5,0.5,0.], [0.5,0.,0.5]],
+            tris: vec![[3,2,0], [2,3,1]],
+        };
+        let (before, flips, _, after) = mesh.repair_reference_defects(&source, &creases, 30.0, 2);
+        assert_eq!(before, 2, "两面都应判为缺陷");
+        assert_eq!(flips, 1);
+        assert_eq!(after, 0);
+        let has_crease_edge = mesh.tris.iter().any(|t| t.contains(&0) && t.contains(&1));
+        assert!(has_crease_edge, "应出现沿折痕的 c0–c1 边:{:?}", mesh.tris);
+        for t in &mesh.tris {
+            let [a, b, c] = t.map(|i| mesh.verts[i as usize].map(|x| x as Real));
+            let (u, v) = (sub(b, a), sub(c, a));
+            let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+            let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            assert!(n[1] / l > 0.99 || n[2] / l > 0.99, "面未贴合源面:{n:?}");
+        }
+    }
+
+    /// P26:折痕旁 0.03mm 的"半吸附"顶点(二面角 90° 的短边 = 查看器里的毛刺)
+    /// 应被塌缩到折痕上的邻点;其余顶点、面朝向不变。
+    #[test]
+    fn crease_spur_vertex_collapses_onto_the_crease() {
+        let source = meshfield::MeshField::new(vec![
+            [[0.,0.,0.], [2.,0.,0.], [0.,1.,0.]],
+            [[0.,0.,0.], [0.,0.,1.], [2.,0.,0.]],
+        ]);
+        let creases = nets::ReferenceCreases::new(&source, 0.4, 35.0);
+        // c0, c1 在折痕(x 轴)上;w 在 z=0 面上离折痕 0.03;t 在 z=0 面,s 在 y=0 面
+        let mut mesh = nets::Mesh {
+            verts: vec![[0.2,0.,0.], [0.5,0.,0.], [0.35,0.03,0.], [0.35,0.5,0.], [0.35,0.,0.5]],
+            tris: vec![[0,2,3], [2,1,3], [0,4,2], [2,4,1]],
+        };
+        let before: Vec<[f32; 3]> = mesh.verts.clone();
+        let (flips, collapses, _) = mesh.merge_crease_spurs(&creases, 30.0, 0.005, 0.12, 0.3, 0.02, 2);
+        // 两条候选对角线共用对边 c0–c1,但只有一条合法:
+        //   (v2,v3) → 新面 [c0,v2,c1] 落在 z=0 面上却是**反向**(绕向为 −z),
+        //             由 spur_agree 拦下(实测该面 agree = −1,不翻);
+        //   (v2,v4) → 新面 [c0,v4,c1] 在 y=0 面、[c1,v2,c0] 在 z=0 面,两面都顺源法线,
+        //             且先把 v2 的 4 个邻面降到 2 个,随后的塌缩才合法(shared==2)。
+        // 所以这里恰好 1 次翻边是设计内的必要步骤,不是漏网的反向面。
+        assert_eq!(flips, 1, "只允许 (v2,v4) 这条合法对角线,(v2,v3) 应被源法线一致度拦下");
+        assert_eq!(collapses, 1, "w 应被塌缩");
+        assert_eq!(mesh.tris.len(), 2);
+        assert_eq!(mesh.verts.len(), 4);
+        assert!(!mesh.verts.contains(&before[2]), "半吸附顶点应消失");
+        for p in &mesh.verts {
+            assert!(before.contains(p), "不应移动任何保留顶点:{p:?}");
+        }
+        // 两个存留面仍分别在 z=0 与 y=0 平面上,朝向与原来一致
+        for t in &mesh.tris {
+            let [a, b, c] = t.map(|i| mesh.verts[i as usize].map(|x| x as Real));
+            let (u, v) = (sub(b, a), sub(c, a));
+            let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+            assert!(n[0].abs() < 1e-9 && (n[1].abs() < 1e-9 || n[2].abs() < 1e-9), "面离开源平面:{n:?}");
+            if n[1].abs() < 1e-9 {
+                assert!(n[2] > 0.0, "z=0 面翻转");
+            } else {
+                assert!(n[1] > 0.0, "y=0 面翻转");
+            }
+        }
     }
 
     #[test]

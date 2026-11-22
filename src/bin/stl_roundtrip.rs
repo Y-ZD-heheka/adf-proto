@@ -57,7 +57,10 @@ fn main() {
     let margin = extent * 0.06 + 1.0;
     let min = [amn[0] - margin, amn[1] - margin, amn[2] - margin];
     let size = extent + 2.0 * margin;
-    let max_depth = (((size / h_target).log2().ceil()) as u8).clamp(6, 10);
+    // 深度上限默认 10;大件(> 200mm)格宽会被钳到 0.2–0.3mm,可设 ADF_MAX_DEPTH=11 让格宽减半
+    // (叶/缓存/提取内存约 ×4)。
+    let depth_cap: u8 = std::env::var("ADF_MAX_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(10).clamp(6, 12);
+    let max_depth = (((size / h_target).log2().ceil()) as u8).clamp(6, depth_cap);
     let h_min = size / (1u64 << max_depth) as Real;
     println!("[domain] 尺寸 {size:.2}mm | depth {max_depth} | h_min {h_min:.4}mm");
 
@@ -113,6 +116,13 @@ fn reconstruct_layer(
     field: meshfield::MeshField, min: [Real; 3], size: Real, max_depth: u8, h_ext: Real,
     closed: bool, preserve_parts: bool,
 ) -> nets::Mesh {
+    // 多壳件(P34):整件不水密/分多层时 preserve_parts 为真,旧版因此整层跳过折痕约束路径
+    // (P26–P33 全部不生效,输出又大又糙)。这里按**层**判:本层自身水密就照常走折痕路径。
+    // ADF_NO_SHELL_CREASES=1 恢复旧行为。
+    // 本层闭合即可(成对反向边,或可用穿越奇偶定号的多重关联边,如妙蛙种子主体 1,245 条
+    // "两片表面沿同一条边相接"的四面边)。折痕索引本身只取恰好成对的边,其余边不参与约束。
+    let layer_tight = field.has_closed_surface();
+    let crease_ok = !preserve_parts || (layer_tight && std::env::var("ADF_NO_SHELL_CREASES").is_err());
     // ── 3) 建 ADF(不切削)──
     let t = Instant::now();
     let adf = Adf::build_with(
@@ -164,7 +174,7 @@ fn reconstruct_layer(
         // 特征保护角(ADF_FEAT_DEG,默认 25°):planar-pair 约束的边阈值
         let feat_deg: f64 = std::env::var("ADF_FEAT_DEG").ok().and_then(|v| v.parse().ok()).unwrap_or(25.0);
         let creases = match &adf.field.base {
-            BaseField::Mesh(source) if closed && !field_post && !preserve_parts =>
+            BaseField::Mesh(source) if closed && !field_post && crease_ok =>
                 Some(nets::ReferenceCreases::new(source, h_ext * 1.2, feat_deg.max(35.0))),
             _ => None,
         };
@@ -220,6 +230,70 @@ fn reconstruct_layer(
             let t = Instant::now();
             mesh.fit_reference(reference, h_ext * 0.5, closed, creases.as_ref());
             println!("[reference] 原始表面投影 {:?}", t.elapsed());
+        }
+        // 折痕毛刺清理(P26/P27):投影收尾后,翻边恢复缺失的折痕边,再把停在折痕旁
+        // 0.005–1.2h 的"半吸附"顶点塌缩/吸附到折痕上,消掉主棱线旁的小毛刺/阶梯/平行短线。只在折痕约束路径上跑;ADF_NO_SPUR=1 可关。
+        if let Some(grid) = creases.as_ref()
+            && std::env::var("ADF_NO_SPUR").is_err()
+        {
+            let t = Instant::now();
+            let nt0 = mesh.tris.len();
+            let (nf, nc, nm) = mesh.merge_crease_spurs(grid, 30.0, 0.005, h_ext * 1.2, h_ext * 3.0, 0.02, 2);
+            println!(
+                "[spur] {:?} | 翻边 {nf} / 塌缩 {nc} / 吸附 {nm} | 三角 {nt0} → {}",
+                t.elapsed(),
+                mesh.tris.len()
+            );
+        }
+        // 按源网格复核修补(P28):面级缺陷(斜跨折痕、退化、偏离源面的小鳍片)用翻边/塌缩消除。
+        // 只在折痕约束路径上跑;ADF_NO_REFFIX=1 可关。
+        if let Some(grid) = creases.as_ref()
+            && std::env::var("ADF_NO_REFFIX").is_err()
+            && let BaseField::Mesh(reference) = &adf.field.base
+        {
+            let t = Instant::now();
+            let (b0, nf, nc, b1) = mesh.repair_reference_defects(reference, grid, 30.0, 4);
+            println!("[reffix] {:?} | 可见缺陷面 {b0} → {b1} | 翻边 {nf} / 塌缩 {nc}", t.elapsed());
+        }
+        // 以源网格为准的二次简化(P29):顶点已在源面上,按源网格判误差继续合并(平面区零误差),
+        // 随后再做一次面级复核。默认开启;ADF_NO_REFDEC=1 可关,ADF_REF_TOL 调容差(默认 0.01mm)。
+        if let Some(grid) = creases.as_ref()
+            && std::env::var("ADF_NO_REFDEC").is_err()
+            && let BaseField::Mesh(reference) = &adf.field.base
+        {
+            let tol: Real = std::env::var("ADF_REF_TOL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.01);
+            let t = Instant::now();
+            let nt0 = mesh.tris.len();
+            let mut n = mesh.decimate_to_reference(reference, grid, tol, 0.005);
+            // 源折痕嵌入(P30):两条折痕汇合处(如圆柱与方板外棱相切)窄于一格的窄条被提取抹成斜坡,
+            // 在这里把缺失的折痕边切回来,再清理切边留下的短边并重新简化。ADF_NO_EMBED=1 可关。
+            let (mut nk, mut ncut) = (0, 0);
+            if std::env::var("ADF_NO_EMBED").is_err() {
+                (nk, ncut) = mesh.embed_reference_creases(grid, 0.005, h_ext * 1.8);
+            }
+            // 交替收尾(P32):二次简化的"共面即精确"分支会把顶点并到一个本来就斜跨折痕的面上,
+            // 重新造出一条斜跨外棱的对角线(桌腿 −Y 切点:两个 0.007/0.033mm² 的斜面,P28 判据
+            // 因偏离 < 0.02mm、法线差 < 37° 看不出)。每次简化后都再做一轮折痕翻边/塌缩/吸附,
+            // 直到两者都不再改动(至多 4 轮)。
+            for _ in 0..4 {
+                let (f, c, m) = mesh.merge_crease_spurs(grid, 30.0, 0.005, h_ext * 1.2, h_ext * 3.0, 0.02, 2);
+                let d = mesh.decimate_to_reference(reference, grid, tol, 0.005);
+                n += d;
+                if f + c + m + d == 0 {
+                    break;
+                }
+            }
+            let (b0, nf, nc, b1) = mesh.repair_reference_defects(reference, grid, 30.0, 2);
+            // 面级复核的翻边/塌缩也可能留下斜跨折痕的面:最后再做一次折痕翻边(不再简化)。
+            mesh.merge_crease_spurs(grid, 30.0, 0.005, h_ext * 1.2, h_ext * 3.0, 0.02, 1);
+            // 视觉毛刺清理(P33):塌缩造成"源件上没有的多余线"的微面。ADF_NO_VISFIX=1 可关。
+            let nvis = if std::env::var("ADF_NO_VISFIX").is_err() { mesh.clean_visual_spurs(reference, 4) } else { 0 };
+            println!(
+                "[refdec] {:?} | tol {tol}mm | 塌缩 {n} | 折痕嵌入 角点 {nk} / 切边 {ncut} | 视觉清理 {nvis} | 三角 {nt0} → {} | 文件 ≈{} KB | 复核 {b0} → {b1}(翻边 {nf} / 塌缩 {nc})",
+                t.elapsed(),
+                mesh.tris.len(),
+                (84 + 50 * mesh.tris.len()) / 1024
+            );
         }
         // 不同索引精确落到同一 f32 导出坐标时，STL 读回会改变顶点关联。
         // 在原有提取结果上重做常规简化，保留薄壁原有的连接关系。

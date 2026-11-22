@@ -28,3 +28,6 @@ rt_*.stl
 
 # qa_render.py 生成的对比渲染图
 _qa_render/
+
+# convert_all.ps1 batch output
+/out/
