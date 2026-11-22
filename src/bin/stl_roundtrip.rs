@@ -137,12 +137,15 @@ fn reconstruct_layer(
     println!("[build] {:?} | 叶 {nl} | ≈{} KB", t.elapsed(), nb / 1024);
 
     // ── 4) 提取和后处理 ──
+    let t = Instant::now();
     let mut mesh = nets::extract_mesh_roundtrip(&adf, h_ext);
+    let t_extract = t.elapsed();
     // 多壳 STL 中小的孤立分量也可能是源模型细节。单壳沿用已有碎屑清理。
     let (nd, nt) = if preserve_parts { (0, 0) } else { mesh.drop_small_components(50, 1e-4) };
     if nt > 0 {
         println!("[clean] 丢弃碎屑分量 {nd} 个 / 三角 {nt}");
     }
+    println!("[extract] 提取 {t_extract:?} | 碎屑清理 {:?} | 三角 {}", t.elapsed() - t_extract, mesh.tris.len());
     // 平滑 + 投影回零等值面:削掉叶边处的扇贝锯齿(位移上限 = 半格)
     // 参考三角面已提供几何约束。切削演示仍用距离场做平滑和吸附；
     // 在无切削模式中再次投向近似场会把已经恢复的棱角拉回粗场。
@@ -179,7 +182,8 @@ fn reconstruct_layer(
             _ => None,
         };
         let before_crease_fit = creases.as_ref().map(|_| mesh.clone());
-        let nc = mesh.decimate_with_creases(err2, feat_deg, 0, creases.as_ref());
+        // P37:大网格分段并行 QEM(ADF_DECIMATE_SERIAL=1 退回串行)
+        let nc = mesh.decimate_with_creases_parallel(err2, feat_deg, creases.as_ref());
         println!(
             "[decimate] {:?} | 塌缩 {nc} 边 | 三角 {nt0} → {} | 文件 ≈{} MB",
             t4.elapsed(),
@@ -261,38 +265,49 @@ fn reconstruct_layer(
             && std::env::var("ADF_NO_REFDEC").is_err()
             && let BaseField::Mesh(reference) = &adf.field.base
         {
-            let tol: Real = std::env::var("ADF_REF_TOL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.01);
+            // 默认容差 0.02mm(P36):0.01 时曲面边隐含弦高中位数只有 0.004–0.006mm,三角数主要由容差决定;
+            // 0.02 仍远低于 FDM 层高(0.1)和光固化 XY 精度(≈0.035)。ADF_REF_TOL=0.01 取最高保真。
+            let tol: Real = std::env::var("ADF_REF_TOL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.02);
             let t = Instant::now();
             let nt0 = mesh.tris.len();
-            let mut n = mesh.decimate_to_reference(reference, grid, tol, 0.005);
+            // 各子步骤耗时(P36):定位慢在哪一步
+            let mut lap = Instant::now();
+            let mut laps: Vec<(&str, std::time::Duration)> = Vec::new();
+            let mut tick = |name: &'static str, lap: &mut Instant| {
+                laps.push((name, lap.elapsed()));
+                *lap = Instant::now();
+            };
+            let mut n = mesh.decimate_to_reference_parallel(reference, grid, tol, 0.005);
+            tick("简化", &mut lap);
             // 源折痕嵌入(P30):两条折痕汇合处(如圆柱与方板外棱相切)窄于一格的窄条被提取抹成斜坡,
             // 在这里把缺失的折痕边切回来,再清理切边留下的短边并重新简化。ADF_NO_EMBED=1 可关。
             let (mut nk, mut ncut) = (0, 0);
             if std::env::var("ADF_NO_EMBED").is_err() {
                 (nk, ncut) = mesh.embed_reference_creases(grid, 0.005, h_ext * 1.8);
             }
+            tick("嵌入", &mut lap);
             // 交替收尾(P32):二次简化的"共面即精确"分支会把顶点并到一个本来就斜跨折痕的面上,
-            // 重新造出一条斜跨外棱的对角线(桌腿 −Y 切点:两个 0.007/0.033mm² 的斜面,P28 判据
-            // 因偏离 < 0.02mm、法线差 < 37° 看不出)。每次简化后都再做一轮折痕翻边/塌缩/吸附,
-            // 直到两者都不再改动(至多 4 轮)。
-            for _ in 0..4 {
-                let (f, c, m) = mesh.merge_crease_spurs(grid, 30.0, 0.005, h_ext * 1.2, h_ext * 3.0, 0.02, 2);
-                let d = mesh.decimate_to_reference(reference, grid, tol, 0.005);
-                n += d;
-                if f + c + m + d == 0 {
-                    break;
-                }
-            }
+            // 重新造出一条斜跨外棱的对角线。每次简化后都再做一轮折痕翻边/塌缩/吸附,直到两者都不再
+            // 改动(至多 4 轮)。P36:补充简化只从锐边带起步(嵌入/清理只改折痕附近),不再全网格重试。
+            // P38:大网格分段并行(alternate_crease_cleanup 内部判断规模)。
+            n += mesh.alternate_crease_cleanup(reference, grid, tol, h_ext);
+            tick("交替收尾", &mut lap);
             let (b0, nf, nc, b1) = mesh.repair_reference_defects(reference, grid, 30.0, 2);
             // 面级复核的翻边/塌缩也可能留下斜跨折痕的面:最后再做一次折痕翻边(不再简化)。
             mesh.merge_crease_spurs(grid, 30.0, 0.005, h_ext * 1.2, h_ext * 3.0, 0.02, 1);
+            tick("复核", &mut lap);
             // 视觉毛刺清理(P33):塌缩造成"源件上没有的多余线"的微面。ADF_NO_VISFIX=1 可关。
             let nvis = if std::env::var("ADF_NO_VISFIX").is_err() { mesh.clean_visual_spurs(reference, 4) } else { 0 };
+            tick("视觉清理", &mut lap);
             println!(
                 "[refdec] {:?} | tol {tol}mm | 塌缩 {n} | 折痕嵌入 角点 {nk} / 切边 {ncut} | 视觉清理 {nvis} | 三角 {nt0} → {} | 文件 ≈{} KB | 复核 {b0} → {b1}(翻边 {nf} / 塌缩 {nc})",
                 t.elapsed(),
                 mesh.tris.len(),
                 (84 + 50 * mesh.tris.len()) / 1024
+            );
+            println!(
+                "[refdec.time] {}",
+                laps.iter().map(|(k, d)| format!("{k} {:.1}s", d.as_secs_f64())).collect::<Vec<_>>().join(" | ")
             );
         }
         // 不同索引精确落到同一 f32 导出坐标时，STL 读回会改变顶点关联。

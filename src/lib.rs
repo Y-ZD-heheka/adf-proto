@@ -2534,6 +2534,34 @@ pub mod nets {
     }
     /// P29:新面在源网格上的采样复核。按 ≤0.3mm 间距(每边 2–8 段)取重心网格点(不含 3 个顶点,
     /// 它们本来就在源面上),要求到源面距离 ≤ `tol`,法线与最近源面(或其旁的源折痕两侧)一致度 ≥ `agree`。
+    /// P36:半径 `r` 内的最近源面(距离, 三角形号);`r` 内没有则 None。BVH 以 r² 作剪枝初值,
+    /// 只展开离 p 不足 r 的子树 —— 结果与无界查询相同(最近点在 r 内时),但快得多:简化/复核里
+    /// 绝大多数查询点本就贴着源面(< 0.02mm),无界查询要先下探到别处再回头收紧。
+    fn closest_within(reference: &meshfield::MeshField, p: [f64; 3], r: f64) -> Option<(f64, u32)> {
+        // 以 (2r)² 作初值:没找到时返回值恰为 2r,与"找到且 ≤ r"无歧义(不依赖 sqrt 的末位舍入)。
+        let (d, t, _, _) = reference.closest_features_seeded(p, 4.0 * r * r);
+        (d <= r).then_some((d, t))
+    }
+
+    /// 到源面的距离与三角形号:先在 0.1mm 内找,找不到再无界查询(结果与 `closest_features` 相同,P37)。
+    fn closest_near(reference: &meshfield::MeshField, p: [f64; 3]) -> (f64, u32) {
+        match closest_within(reference, p, 0.1) {
+            Some(x) => x,
+            None => {
+                let (d, t, _, _) = reference.closest_features(p);
+                (d, t)
+            }
+        }
+    }
+
+    /// 最近源面三角形号:先在 0.1mm 内找,找不到再无界查询(结果与 `closest_features` 相同)。
+    fn closest_face_near(reference: &meshfield::MeshField, p: [f64; 3]) -> u32 {
+        match closest_within(reference, p, 0.1) {
+            Some((_, t)) => t,
+            None => reference.closest_features(p).1,
+        }
+    }
+
     fn ref_sample_ok(reference: &meshfield::MeshField, grid: &ReferenceCreases, p: [[f64; 3]; 3], tol: f64, agree: f64) -> bool {
         let n = spur_normal(p);
         let l = len(n);
@@ -2552,10 +2580,9 @@ pub mod nets {
                     add(add(scale(p[0], i as f64), scale(p[1], j as f64)), scale(p[2], k as f64)),
                     1.0 / m as f64,
                 );
-                let (d, t, _, _) = reference.closest_features(s);
-                if d > tol {
+                let Some((d, t)) = closest_within(reference, s, tol) else {
                     return false;
-                }
+                };
                 let mut ag = dot3(n, reference.face_normal(t));
                 if ag < agree
                     && let Some((dk, _, [a, b])) = grid.nearest(s)
@@ -2586,14 +2613,14 @@ pub mod nets {
         ];
         let mut dmax: f64 = 0.0;
         for s in samples {
-            dmax = dmax.max(reference.closest_features(s).0);
+            dmax = dmax.max(closest_near(reference, s).0);
         }
         let n = spur_normal(p);
         let l = len(n);
         let agree = if l < 1e-14 {
             -1.0
         } else {
-            let (dc, t, _, _) = reference.closest_features(c);
+            let (dc, t) = closest_near(reference, c);
             let mut ag = dot3(n, reference.face_normal(t)) / l;
             if let Some((dk, _, [a, b])) = grid.nearest(c)
                 && dk <= dc + 0.005
@@ -2614,10 +2641,15 @@ pub mod nets {
         vhash: std::collections::HashMap<[i64; 3], Vec<u32>, FxBuild>,
         cell: f64,
         on_tol: f64,
+        /// P36:面的均匀网格(按面包围盒登记;跨格过多的大面放进 `big`,每次查询都带上)。
+        /// 旧版每个角点、每次切边都遍历全部面并在切边后从头重扫,翅膀上是 ~10¹⁰ 次面访问。
+        fgrid: std::collections::HashMap<[i64; 3], Vec<u32>, FxBuild>,
+        big: Vec<u32>,
+        fcell: f64,
     }
 
     impl<'a> CreaseEmbed<'a> {
-        fn new(verts: &'a mut Vec<[f32; 3]>, tris: &'a mut Vec<[u32; 3]>, on_tol: f64) -> Self {
+        fn new(verts: &'a mut Vec<[f32; 3]>, tris: &'a mut Vec<[u32; 3]>, on_tol: f64, fcell: f64) -> Self {
             let cell = (on_tol * 4.0).max(1e-3);
             let mut emap: std::collections::HashMap<u64, Vec<u32>, FxBuild> =
                 std::collections::HashMap::with_capacity_and_hasher(tris.len() * 3, FxBuild);
@@ -2631,7 +2663,57 @@ pub mod nets {
             for (vi, v) in verts.iter().enumerate() {
                 vhash.entry(g64(*v).map(|x| (x / cell).floor() as i64)).or_default().push(vi as u32);
             }
-            Self { verts, tris, emap, vhash, cell, on_tol }
+            let mut e = Self { verts, tris, emap, vhash, cell, on_tol, fgrid: Default::default(), big: Vec::new(), fcell };
+            for fi in 0..e.tris.len() as u32 {
+                e.grid_insert(fi);
+            }
+            e
+        }
+
+        fn fkey(&self, p: [f64; 3]) -> [i64; 3] {
+            p.map(|x| (x / self.fcell).floor() as i64)
+        }
+
+        fn grid_insert(&mut self, fi: u32) {
+            let p = self.tris[fi as usize].map(|i| g64(self.verts[i as usize]));
+            let lo = self.fkey([0, 1, 2].map(|k| p[0][k].min(p[1][k]).min(p[2][k])));
+            let hi = self.fkey([0, 1, 2].map(|k| p[0][k].max(p[1][k]).max(p[2][k])));
+            let span = (0..3).map(|k| (hi[k] - lo[k] + 1) as u64).product::<u64>();
+            if span > 512 {
+                self.big.push(fi);
+                return;
+            }
+            for x in lo[0]..=hi[0] {
+                for y in lo[1]..=hi[1] {
+                    for z in lo[2]..=hi[2] {
+                        self.fgrid.entry([x, y, z]).or_default().push(fi);
+                    }
+                }
+            }
+        }
+
+        /// 包围盒与以 `pts` 中各点为中心、边长 2·(fcell) 的立方体相交的面(去重、升序)。
+        fn faces_near(&self, pts: &[[f64; 3]]) -> Vec<u32> {
+            let mut out: Vec<u32> = self.big.clone();
+            let mut seen: std::collections::HashSet<[i64; 3], FxBuild> = Default::default();
+            for &p in pts {
+                let k = self.fkey(p);
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            let c = [k[0] + dx, k[1] + dy, k[2] + dz];
+                            if seen.insert(c)
+                                && let Some(list) = self.fgrid.get(&c)
+                            {
+                                out.extend_from_slice(list);
+                            }
+                        }
+                    }
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
         }
 
         fn pos(&self, i: u32) -> [f64; 3] {
@@ -2676,6 +2758,8 @@ pub mod nets {
             for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
                 self.emap.entry(spur_edge_key(a, b)).or_default().push(fi);
             }
+            // 新顶点可能离原边 ≤ r_cut,面包围盒可能变大:补登记(旧登记保留,查询时按几何再筛)
+            self.grid_insert(fi);
         }
 
         fn push_face(&mut self, t: [u32; 3]) {
@@ -2684,6 +2768,7 @@ pub mod nets {
             for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
                 self.emap.entry(spur_edge_key(a, b)).or_default().push(fi);
             }
+            self.grid_insert(fi);
         }
 
         /// 子面 `pn` 替换(或部分替换)原面 `po` 时是否可接受。
@@ -2763,7 +2848,9 @@ pub mod nets {
                 return false;
             }
             let mut best: Option<(f64, u32, [f64; 3])> = None;
-            for (fi, t) in self.tris.iter().enumerate() {
+            // fcell ≥ 2·r_cut ⟹ 包围盒 ± r_cut 含 c 的面都登记在 c 所在格的 3×3×3 邻域内
+            for fi in self.faces_near(&[c]) {
+                let t = self.tris[fi as usize];
                 let p = t.map(|i| g64(self.verts[i as usize]));
                 let lo = [0, 1, 2].map(|k| p[0][k].min(p[1][k]).min(p[2][k]) - r_cut);
                 let hi = [0, 1, 2].map(|k| p[0][k].max(p[1][k]).max(p[2][k]) + r_cut);
@@ -2808,9 +2895,13 @@ pub mod nets {
             let hi = [0, 1, 2].map(|k| a0[k].max(b0[k]) + 2.0 * r_cut);
             let inside = |p: [f64; 3]| (0..3).all(|k| p[k] >= lo[k] && p[k] <= hi[k]);
             let mut rejected: std::collections::HashSet<u64, FxBuild> = Default::default();
+            // 沿线段每隔半格取点做邻域查询:fcell ≥ 4·r_cut ⟹ 覆盖到线段 2·r_cut 内的全部面。
+            let steps = (len(ab) / (0.5 * self.fcell)).ceil().max(1.0) as usize;
+            let probes: Vec<[f64; 3]> = (0..=steps).map(|i| add(a0, scale(ab, i as f64 / steps as f64))).collect();
             let mut n = 0usize;
             'scan: for _ in 0..10_000 {
-                for fi in 0..self.tris.len() {
+                for fi in self.faces_near(&probes) {
+                    let fi = fi as usize;
                     let t = self.tris[fi];
                     if !t.iter().any(|&v| inside(self.pos(v))) {
                         continue;
@@ -2900,8 +2991,7 @@ pub mod nets {
         let mid = scale(add(pa, pb), 0.5);
         let probe = |p: [[f64; 3]; 3]| {
             let c = scale(add(add(p[0], p[1]), p[2]), 1.0 / 3.0);
-            let (_, t, _, _) = reference.closest_features(add(mid, scale(sub(c, mid), 0.3)));
-            reference.face_normal(t)
+            reference.face_normal(closest_face_near(reference, add(mid, scale(sub(c, mid), 0.3))))
         };
         let sdev = dot3(probe(p1), probe(p2)).clamp(-1.0, 1.0).acos().to_degrees();
         (dev - sdev - 15.0).max(0.0)
@@ -2915,17 +3005,95 @@ pub mod nets {
             return 180.0;
         }
         let c = scale(add(add(p[0], p[1]), p[2]), 1.0 / 3.0);
-        let (_, t, _, _) = reference.closest_features(c);
+        let t = closest_face_near(reference, c);
         (dot3(n, reference.face_normal(t)) / l).clamp(-1.0, 1.0).acos().to_degrees()
     }
 
-    /// P33:面上 7 个采样点(3 顶点、质心、3 边中点)到源面的最大距离。
+    /// P33:面上 7 个采样点(3 顶点、质心、3 边中点)到源面的最大距离。调用方只比较是否 > 0.02mm,
+    /// 故任一点在 0.0201mm 内找不到源面即返回 ∞ 并提前结束(P36)。
     fn ref_face_max_distance(reference: &meshfield::MeshField, p: [[f64; 3]; 3]) -> f64 {
         let c = scale(add(add(p[0], p[1]), p[2]), 1.0 / 3.0);
-        [p[0], p[1], p[2], c, scale(add(p[0], p[1]), 0.5), scale(add(p[1], p[2]), 0.5), scale(add(p[2], p[0]), 0.5)]
-            .into_iter()
-            .map(|s| reference.closest_features(s).0)
-            .fold(0.0, f64::max)
+        let mut dmax: f64 = 0.0;
+        for s in [p[0], p[1], p[2], c, scale(add(p[0], p[1]), 0.5), scale(add(p[1], p[2]), 0.5), scale(add(p[2], p[0]), 0.5)] {
+            match closest_within(reference, s, 0.0201) {
+                Some((d, _)) => dmax = dmax.max(d),
+                None => return f64::INFINITY,
+            }
+        }
+        dmax
+    }
+
+    /// P40:按较小顶点号分行的无向边表(CSR)。面 f 的第 k 条边 (t[k], t[k+1]) 记为 (较大顶点号, f·3+k),
+    /// 放在较小顶点号那一行;行内按较大顶点号**稳定**排序 ⟹ 同一条边的各次出现保持面序、边序。
+    /// 内存 8 字节 / 半边(旧 HashMap 约 16 字节 + 控制字节 / 槽,且容量按 n·3 预分配)。
+    struct EdgeRows {
+        start: Vec<u32>,
+        ent: Vec<(u32, u32)>,
+    }
+
+    impl EdgeRows {
+        /// 无向边 (a, b) 的全部出现(按面序、边序)。
+        fn run(&self, a: u32, b: u32) -> &[(u32, u32)] {
+            let (lo, hi) = (a.min(b) as usize, a.max(b));
+            let row = &self.ent[self.start[lo] as usize..self.start[lo + 1] as usize];
+            let s = row.partition_point(|x| x.0 < hi);
+            let e = s + row[s..].partition_point(|x| x.0 <= hi);
+            &row[s..e]
+        }
+    }
+
+    fn edge_rows(tris: &[[u32; 3]], nv: usize) -> EdgeRows {
+        let mut start = vec![0u32; nv + 1];
+        for t in tris {
+            for k in 0..3 {
+                start[t[k].min(t[(k + 1) % 3]) as usize + 1] += 1;
+            }
+        }
+        for i in 0..nv {
+            start[i + 1] += start[i];
+        }
+        let mut cur: Vec<u32> = start[..nv].to_vec();
+        let mut ent = vec![(0u32, 0u32); tris.len() * 3];
+        for (f, t) in tris.iter().enumerate() {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                let c = &mut cur[a.min(b) as usize];
+                ent[*c as usize] = (a.max(b), (f * 3 + k) as u32);
+                *c += 1;
+            }
+        }
+        drop(cur);
+        // 行内稳定排序:按条目数均分到各线程(行边界切分),互不重叠
+        let nt = nthreads().max(1);
+        let target = ent.len().div_ceil(nt).max(1);
+        let mut cuts: Vec<usize> = (0..=nt)
+            .map(|w| if w == nt { nv } else { start.partition_point(|&s| (s as usize) < w * target).min(nv) })
+            .collect();
+        for i in 1..cuts.len() {
+            cuts[i] = cuts[i].max(cuts[i - 1]);
+        }
+        {
+            let start = &start;
+            std::thread::scope(|sc| {
+                let mut rest: &mut [(u32, u32)] = &mut ent;
+                let mut off = 0usize;
+                for w in 0..nt {
+                    let (r0, r1) = (cuts[w], cuts[w + 1]);
+                    let e1 = start[r1] as usize;
+                    let (mine, tail) = std::mem::take(&mut rest).split_at_mut(e1 - off);
+                    rest = tail;
+                    let base = off;
+                    off = e1;
+                    sc.spawn(move || {
+                        for r in r0..r1 {
+                            let (a, b) = (start[r] as usize - base, start[r + 1] as usize - base);
+                            mine[a..b].sort_by_key(|x| x.0);
+                        }
+                    });
+                }
+            });
+        }
+        EdgeRows { start, ent }
     }
 
     /// 一个面由 `po` 变成 `pn` 是否可接受:不退化;不成为薄片(除非旧面更差);
@@ -3009,11 +3177,29 @@ pub mod nets {
             min_quality: f64,
             rounds: usize,
         ) -> (usize, usize, usize) {
+            self.merge_crease_spurs_locked(grid, sharp_deg, on_tol, off_max, max_len, min_quality, rounds, None, true)
+        }
+
+        /// P38:`locked` 中的顶点不参与翻边(四个顶点任一被锁即跳过)、塌缩(两端任一)与吸附;
+        /// `compact` 为假时塌缩只删死面、顶点号不变(分段模式)。
+        #[allow(clippy::too_many_arguments)]
+        fn merge_crease_spurs_locked(
+            &mut self,
+            grid: &ReferenceCreases,
+            sharp_deg: f64,
+            on_tol: Real,
+            off_max: Real,
+            max_len: Real,
+            min_quality: f64,
+            rounds: usize,
+            locked: Option<&[bool]>,
+            compact: bool,
+        ) -> (usize, usize, usize) {
             let (mut nf, mut nc, mut nm) = (0, 0, 0);
             for _ in 0..rounds {
-                let f = self.flip_onto_creases(grid, sharp_deg, on_tol, min_quality);
-                let c = self.collapse_onto_creases(grid, sharp_deg, on_tol, off_max, max_len, min_quality);
-                let m = self.move_onto_creases(grid, sharp_deg, on_tol, off_max, min_quality);
+                let f = self.flip_onto_creases(grid, sharp_deg, on_tol, min_quality, locked);
+                let c = self.collapse_onto_creases(grid, sharp_deg, on_tol, off_max, max_len, min_quality, locked, compact);
+                let m = self.move_onto_creases(grid, sharp_deg, on_tol, off_max, min_quality, locked);
                 nf += f;
                 nc += c;
                 nm += m;
@@ -3066,7 +3252,7 @@ pub mod nets {
         }
 
         /// 第 1 步:翻边恢复缺失的折痕边。
-        fn flip_onto_creases(&mut self, grid: &ReferenceCreases, sharp_deg: f64, on_tol: Real, min_quality: f64) -> usize {
+        fn flip_onto_creases(&mut self, grid: &ReferenceCreases, sharp_deg: f64, on_tol: Real, min_quality: f64, locked: Option<&[bool]>) -> usize {
             let band = self.sharp_band(sharp_deg);
             let on: Vec<bool> = (0..self.verts.len())
                 .map(|v| band[v] && grid.distance(g64(self.verts[v])).is_some_and(|d| d < on_tol))
@@ -3114,6 +3300,9 @@ pub mod nets {
                 if a == b || !on[a as usize] || !on[b as usize] || emap.contains_key(&spur_edge_key(a, b)) {
                     continue;
                 }
+                if locked.is_some_and(|l| [w, x, a, b].iter().any(|&v| l[v as usize])) {
+                    continue;
+                }
                 let (pw, px, pa, pb) = (
                     g64(self.verts[w as usize]),
                     g64(self.verts[x as usize]),
@@ -3153,6 +3342,8 @@ pub mod nets {
             off_max: Real,
             max_len: Real,
             min_quality: f64,
+            locked: Option<&[bool]>,
+            compact: bool,
         ) -> usize {
             let nv = self.verts.len();
             let nt = self.tris.len();
@@ -3165,6 +3356,7 @@ pub mod nets {
                 .collect();
             let mut order: Vec<u32> = (0..nv as u32)
                 .filter(|&v| dist[v as usize] >= on_tol && dist[v as usize] < off_max)
+                .filter(|&v| !locked.is_some_and(|l| l[v as usize]))
                 .collect();
             order.sort_by(|a, b| dist[*a as usize].total_cmp(&dist[*b as usize]).then(a.cmp(b)));
             let mut v2t: Vec<Vec<u32>> = vec![Vec::new(); nv];
@@ -3194,7 +3386,7 @@ pub mod nets {
                 let nw = nbrs_of(&v2t, &self.tris, w);
                 let mut ons: Vec<(Real, u32)> = nw
                     .iter()
-                    .filter(|&&u| dist[u as usize] < on_tol)
+                    .filter(|&&u| dist[u as usize] < on_tol && !locked.is_some_and(|l| l[u as usize]))
                     .map(|&u| (len(sub(g64(self.verts[u as usize]), pw)), u))
                     .filter(|&(l, _)| l <= max_len)
                     .collect();
@@ -3246,7 +3438,14 @@ pub mod nets {
                     break;
                 }
             }
-            if n_collapsed > 0 {
+            if n_collapsed > 0 && !compact {
+                let mut k2 = 0usize;
+                self.tris.retain(|_| {
+                    let keep = !dead[k2];
+                    k2 += 1;
+                    keep
+                });
+            } else if n_collapsed > 0 {
                 let mut remap = vec![u32::MAX; nv];
                 let mut verts = Vec::with_capacity(nv);
                 let mut tris = Vec::with_capacity(nt);
@@ -3276,6 +3475,7 @@ pub mod nets {
             on_tol: Real,
             off_max: Real,
             min_quality: f64,
+            locked: Option<&[bool]>,
         ) -> usize {
             let nv = self.verts.len();
             let band = self.sharp_band(sharp_deg);
@@ -3287,7 +3487,7 @@ pub mod nets {
             }
             let mut n = 0usize;
             for w in 0..nv {
-                if !band[w] || v2t[w].is_empty() {
+                if !band[w] || v2t[w].is_empty() || locked.is_some_and(|l| l[w]) {
                     continue;
                 }
                 let Some((d, q, _)) = grid.nearest(g64(self.verts[w])) else { continue };
@@ -3590,6 +3790,67 @@ pub mod nets {
             tol: Real,
             on_tol: Real,
         ) -> usize {
+            self.decimate_to_reference_seeded(reference, grid, tol, on_tol, None, None, true)
+        }
+
+        /// P37:`decimate_to_reference` 的分段并行版。各段内跨段顶点自动锁定(段界边只有 1 个面,
+        /// 本函数本就锁定非 2 面边的端点),且顶点从不移动;合并后只在接缝 2 环内再做一遍并压缩。
+        /// 判据对源网格是绝对的(采样距离 ≤ tol),两遍不会累积误差。< 20 万三角或 `ADF_DECIMATE_SERIAL` 时串行。
+        pub fn decimate_to_reference_parallel(
+            &mut self,
+            reference: &meshfield::MeshField,
+            grid: &ReferenceCreases,
+            tol: Real,
+            on_tol: Real,
+        ) -> usize {
+            let k: usize = std::env::var("ADF_DECIMATE_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
+            if k < 2 || self.tris.len() < 200_000 || std::env::var_os("ADF_DECIMATE_SERIAL").is_some() {
+                return self.decimate_to_reference(reference, grid, tol, on_tol);
+            }
+            self.decimate_to_reference_blocks(reference, grid, tol, on_tol, k)
+        }
+
+        /// 分段并行源网格简化本体(无规模门槛,测试直接调用)。
+        pub fn decimate_to_reference_blocks(
+            &mut self,
+            reference: &meshfield::MeshField,
+            grid: &ReferenceCreases,
+            tol: Real,
+            on_tol: Real,
+            k: usize,
+        ) -> usize {
+            let (n, cross) = self.run_in_slabs(k.max(1), |m, lock| {
+                m.decimate_to_reference_seeded(reference, grid, tol, on_tol, None, Some(lock), false)
+            });
+            let near = self.ring_expand(&cross, 2);
+            let lock: Vec<bool> = near.iter().map(|&b| !b).collect();
+            n + self.decimate_to_reference_seeded(reference, grid, tol, on_tol, Some(near), Some(lock.as_slice()), true)
+        }
+
+        /// 与 `decimate_to_reference` 相同,但只从锐边带(二面角 > 30° 的边端点及其 1 环)上的边起步
+        /// (塌缩后邻边照常入堆,改动可向外扩散)。P36:嵌入/毛刺清理只改折痕附近,之后的补充简化
+        /// 没必要把全网格上一轮已被拒绝的边再试一遍(翅膀每轮 ~150 万次被拒尝试,每次都采样源面)。
+        pub fn decimate_to_reference_near_creases(
+            &mut self,
+            reference: &meshfield::MeshField,
+            grid: &ReferenceCreases,
+            tol: Real,
+            on_tol: Real,
+        ) -> usize {
+            let seed = self.sharp_band(30.0);
+            self.decimate_to_reference_seeded(reference, grid, tol, on_tol, Some(seed), None, true)
+        }
+
+        fn decimate_to_reference_seeded(
+            &mut self,
+            reference: &meshfield::MeshField,
+            grid: &ReferenceCreases,
+            tol: Real,
+            on_tol: Real,
+            seed: Option<Vec<bool>>,
+            extra_lock: Option<&[bool]>,
+            compact: bool,
+        ) -> usize {
             const PLANE_EPS: f64 = 2e-4;
             const AGREE: f64 = 0.95;
             const QMIN: f64 = 0.01;
@@ -3622,6 +3883,11 @@ pub mod nets {
                     locked[(k & 0xffff_ffff) as usize] = true;
                 }
             }
+            if let Some(x) = extra_lock {
+                for (l, &e) in locked.iter_mut().zip(x) {
+                    *l |= e;
+                }
+            }
             let mut v2t: Vec<Vec<u32>> = vec![Vec::new(); nv];
             for (ti, t) in self.tris.iter().enumerate() {
                 for &v in t {
@@ -3645,6 +3911,11 @@ pub mod nets {
                 std::collections::BinaryHeap::with_capacity(keys.len());
             for k in keys {
                 let (a, b) = ((k >> 32) as u32, (k & 0xffff_ffff) as u32);
+                if let Some(sd) = seed.as_ref()
+                    && !(sd[a as usize] || sd[b as usize])
+                {
+                    continue;
+                }
                 heap.push(std::cmp::Reverse((elen(a, b).to_bits(), a, b, 0, 0)));
             }
             let mut ver = vec![0u32; nv];
@@ -3730,8 +4001,17 @@ pub mod nets {
                     break 'dir;
                 }
             }
-            if n > 0 {
+            if compact {
+                // 无塌缩时也压缩:分段合并后的孤点要在这里清掉
                 self.compact_dead(&dead);
+            } else if n > 0 {
+                // P37 分段模式:顶点号不变,只删死面
+                let mut k2 = 0usize;
+                self.tris.retain(|_| {
+                    let keep = !dead[k2];
+                    k2 += 1;
+                    keep
+                });
             }
             n
         }
@@ -3759,7 +4039,8 @@ pub mod nets {
             if self.tris.is_empty() {
                 return (0, 0);
             }
-            let mut e = CreaseEmbed::new(&mut self.verts, &mut self.tris, on_tol);
+            // 面网格格宽 ≥ 4·r_cut:角点查询与沿线段查询都只需 3×3×3 邻域(见 faces_near 调用处)
+            let mut e = CreaseEmbed::new(&mut self.verts, &mut self.tris, on_tol, (4.0 * r_cut).max(0.5));
             let mut n_corner = 0usize;
             for c in grid.corners() {
                 if e.insert_corner(c, r_cut) {
@@ -3786,18 +4067,45 @@ pub mod nets {
         /// 返回塌缩次数。Python 原型实测(叶轮 h=0.1 mult=1,P32 Rust 输出上 4 轮):多余线 622 → 101、
         /// 其中 > 30° 的 272 → 9;三角 25,578 → 24,644;非流形 22 → 0;真缺陷折叠 4 → 0;输出→源 p99 0.0087mm。
         pub fn clean_visual_spurs(&mut self, reference: &meshfield::MeshField, rounds: usize) -> usize {
+            // P38:大网格先分段并行清理(跨段顶点锁定、不压缩),再在接缝 2 环内串行清理(其余锁定)并压缩。
+            // 段数固定(`ADF_DECIMATE_BLOCKS`,默认 32)⟹ 与线程数无关。< 20 万三角或 `ADF_DECIMATE_SERIAL` 时串行。
+            let k: usize = std::env::var("ADF_DECIMATE_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
+            if k >= 2 && self.tris.len() >= 200_000 && std::env::var_os("ADF_DECIMATE_SERIAL").is_none() {
+                return self.clean_visual_spurs_blocks(reference, rounds, k);
+            }
+            self.clean_visual_spurs_locked(reference, rounds, None, true)
+        }
+
+        /// 分段并行视觉清理本体(无规模门槛,测试直接调用)。
+        pub fn clean_visual_spurs_blocks(&mut self, reference: &meshfield::MeshField, rounds: usize, k: usize) -> usize {
+            let (n, cross) = self.run_in_slabs(k.max(1), |m, lock| m.clean_visual_spurs_locked(reference, rounds, Some(lock), false));
+            let near = self.ring_expand(&cross, 2);
+            let lock: Vec<bool> = near.iter().map(|&b| !b).collect();
+            n + self.clean_visual_spurs_locked(reference, rounds, Some(lock.as_slice()), true)
+        }
+
+        /// `locked`:任一端点被锁的边不塌缩(跨段顶点的邻域在本段内不完整,链接条件会漏判);
+        /// `compact`:为假时只删死面、顶点号不变(分段模式)。
+        fn clean_visual_spurs_locked(&mut self, reference: &meshfield::MeshField, rounds: usize, locked: Option<&[bool]>, compact: bool) -> usize {
+            // 带锁时轮间不得压缩(压缩会重编顶点号,`locked` 随即失效),只在最后压缩一次。
+            let inner_compact = compact && locked.is_none();
             let mut total = 0usize;
             for _ in 0..rounds {
-                let n = self.clean_visual_spurs_once(reference);
+                let n = self.clean_visual_spurs_once(reference, locked, inner_compact);
                 total += n;
                 if n == 0 {
                     break;
                 }
             }
+            if compact && (!inner_compact || total == 0) {
+                // 清掉分段合并后的孤点与带锁轮次留下的孤点
+                let dead = vec![false; self.tris.len()];
+                self.compact_dead(&dead);
+            }
             total
         }
 
-        fn clean_visual_spurs_once(&mut self, reference: &meshfield::MeshField) -> usize {
+        fn clean_visual_spurs_once(&mut self, reference: &meshfield::MeshField, locked: Option<&[bool]>, compact: bool) -> usize {
             let nv = self.verts.len();
             let nt = self.tris.len();
             if nt == 0 {
@@ -3825,21 +4133,37 @@ pub mod nets {
             let mut keys: Vec<u64> = emap.iter().filter(|(_, e)| e[2] == 2).map(|(k, _)| *k).collect();
             keys.sort_unstable();
             let pos = |verts: &[[f32; 3]], t: [u32; 3]| t.map(|i| g64(verts[i as usize]));
-            let mut cand: Vec<(f64, u32, u32)> = Vec::new();
-            for key in keys {
-                let e = emap[&key];
-                let (a, b) = ((key >> 32) as u32, (key & 0xffff_ffff) as u32);
-                let ex = visual_excess(
-                    reference,
-                    pos(&self.verts, self.tris[e[0] as usize]),
-                    pos(&self.verts, self.tris[e[1] as usize]),
-                    g64(self.verts[a as usize]),
-                    g64(self.verts[b as usize]),
-                );
-                if ex > 0.0 {
-                    cand.push((ex, e[0], e[1]));
-                }
-            }
+            // P38:候选扫描是纯函数(每条边 0–2 次源面查询),按排好序的键分块并行、按块序拼接 ⟹ 与串行一致。
+            let mut cand: Vec<(f64, u32, u32)> = {
+                let (verts, tris, emap) = (&self.verts, &self.tris, &emap);
+                let chunk = keys.len().div_ceil(nthreads()).max(1);
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = keys
+                        .chunks(chunk)
+                        .map(|part| {
+                            scope.spawn(move || {
+                                let mut out = Vec::new();
+                                for &key in part {
+                                    let e = emap[&key];
+                                    let (a, b) = ((key >> 32) as u32, (key & 0xffff_ffff) as u32);
+                                    let ex = visual_excess(
+                                        reference,
+                                        pos(verts, tris[e[0] as usize]),
+                                        pos(verts, tris[e[1] as usize]),
+                                        g64(verts[a as usize]),
+                                        g64(verts[b as usize]),
+                                    );
+                                    if ex > 0.0 {
+                                        out.push((ex, e[0], e[1]));
+                                    }
+                                }
+                                out
+                            })
+                        })
+                        .collect();
+                    handles.into_iter().flat_map(|h| h.join().expect("候选扫描线程 panic")).collect()
+                })
+            };
             cand.sort_by(|x, y| y.0.total_cmp(&x.0).then(x.1.cmp(&y.1)).then(x.2.cmp(&y.2)));
             let mut dead = vec![false; nt];
             let mut n = 0usize;
@@ -3859,6 +4183,9 @@ pub mod nets {
                     let elen = |e: (u32, u32), verts: &[[f32; 3]]| len(sub(g64(verts[e.0 as usize]), g64(verts[e.1 as usize])));
                     edges.sort_by(|p, q| elen(*p, &self.verts).total_cmp(&elen(*q, &self.verts)));
                     for (x, y) in edges {
+                        if locked.is_some_and(|l| l[x as usize] || l[y as usize]) {
+                            continue;
+                        }
                         for (w, u) in [(x, y), (y, x)] {
                             if self.try_visual_collapse(reference, &mut v2t, &mut dead, w, u) {
                                 n += 1;
@@ -3869,7 +4196,16 @@ pub mod nets {
                 }
             }
             if n > 0 {
-                self.compact_dead(&dead);
+                if compact {
+                    self.compact_dead(&dead);
+                } else {
+                    let mut k2 = 0usize;
+                    self.tris.retain(|_| {
+                        let keep = !dead[k2];
+                        k2 += 1;
+                        keep
+                    });
+                }
             }
             n
         }
@@ -3994,6 +4330,65 @@ pub mod nets {
             true
         }
 
+        /// P38:嵌入之后的"折痕清理 ↔ 补充简化"交替收尾。大网格时整段循环分 32 段并行(跨段顶点锁定、
+        /// 不压缩),再在接缝 2 环内串行重跑一遍(其余锁定)并压缩;小网格直接串行。返回补充简化的塌缩数。
+        pub fn alternate_crease_cleanup(
+            &mut self,
+            reference: &meshfield::MeshField,
+            grid: &ReferenceCreases,
+            tol: Real,
+            h_ext: Real,
+        ) -> usize {
+            let k: usize = std::env::var("ADF_DECIMATE_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
+            if k >= 2 && self.tris.len() >= 200_000 && std::env::var_os("ADF_DECIMATE_SERIAL").is_none() {
+                return self.alternate_crease_cleanup_blocks(reference, grid, tol, h_ext, k);
+            }
+            self.alternate_crease_cleanup_locked(reference, grid, tol, h_ext, None, true)
+        }
+
+        /// 分段并行交替收尾本体(无规模门槛,测试直接调用)。
+        pub fn alternate_crease_cleanup_blocks(
+            &mut self,
+            reference: &meshfield::MeshField,
+            grid: &ReferenceCreases,
+            tol: Real,
+            h_ext: Real,
+            k: usize,
+        ) -> usize {
+            let (n, cross) = self.run_in_slabs(k.max(1), |m, lock| m.alternate_crease_cleanup_locked(reference, grid, tol, h_ext, Some(lock), false));
+            let near = self.ring_expand(&cross, 2);
+            let lock: Vec<bool> = near.iter().map(|&b| !b).collect();
+            n + self.alternate_crease_cleanup_locked(reference, grid, tol, h_ext, Some(lock.as_slice()), true)
+        }
+
+        fn alternate_crease_cleanup_locked(
+            &mut self,
+            reference: &meshfield::MeshField,
+            grid: &ReferenceCreases,
+            tol: Real,
+            h_ext: Real,
+            locked: Option<&[bool]>,
+            compact: bool,
+        ) -> usize {
+            // 带锁时步骤间不得压缩(压缩会重编顶点号,`locked` 随即失效),只在最后压缩一次。
+            let inner_compact = compact && locked.is_none();
+            let mut n = 0usize;
+            for _ in 0..4 {
+                let (f, c, m) = self.merge_crease_spurs_locked(grid, 30.0, 0.005, h_ext * 1.2, h_ext * 3.0, 0.02, 2, locked, inner_compact);
+                let seed = self.sharp_band(30.0);
+                let d = self.decimate_to_reference_seeded(reference, grid, tol, 0.005, Some(seed), locked, inner_compact);
+                n += d;
+                if f + c + m + d == 0 {
+                    break;
+                }
+            }
+            if compact {
+                let dead = vec![false; self.tris.len()];
+                self.compact_dead(&dead);
+            }
+            n
+        }
+
         /// 删除标记为死的三角与由此孤立的顶点(保持其余顶点/三角的相对顺序)。
         fn compact_dead(&mut self, dead: &[bool]) {
             let nv = self.verts.len();
@@ -4028,31 +4423,15 @@ pub mod nets {
         /// 返回翻转的三角数。
         pub fn orient_consistently(&mut self) -> usize {
             let n = self.tris.len();
-            // 边表:(tri<<1|方向) 打包成 u32,每条边两个槽 —— 避免每个边一次 Vec 分配
-            // (实测 Vec 版 482k 三角要 260ms,打包版降到 ~60ms)
-            const EMPTY: u32 = u32::MAX;
-            let mut map: std::collections::HashMap<u64, [u32; 2], FxBuild> =
-                std::collections::HashMap::with_capacity_and_hasher(n * 3, FxBuild);
-            for (ti, t) in self.tris.iter().enumerate() {
-                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                    let key = if a < b {
-                        ((a as u64) << 32) | b as u64
-                    } else {
-                        ((b as u64) << 32) | a as u64
-                    };
-                    let packed = ((ti as u32) << 1) | (a < b) as u32;
-                    let slot = map.entry(key).or_insert([EMPTY, EMPTY]);
-                    if slot[0] == EMPTY {
-                        slot[0] = packed;
-                    } else if slot[1] == EMPTY {
-                        slot[1] = packed;
-                    } else {
-                        // 非流形边:标记为"不可用",定向时不跨越它
-                        slot[1] = EMPTY;
-                        slot[0] = EMPTY;
-                    }
-                }
-            }
+            // P40:边表由 n·3 容量的 HashMap 换成按较小顶点号分行的 CSR(`edge_rows`),查询 = 行内二分。
+            // 结果与旧版逐位一致:旧版槽位按插入依次 [空,空]→[x,空]→[x,y]→(第 3 次)[空,空]→… 循环,
+            // 某条边可用 ⟺ 出现次数 c ≡ 2 (mod 3),两槽 = 最后两次出现(行内按面序、边序排列 = 插入序)。
+            // 方向位 nf 取自邻面的**原始**朝向:只在邻面未访问时读取,而未访问的面从未被翻转过。
+            let rows = edge_rows(&self.tris, self.verts.len());
+            let slot_of = |run: &[(u32, u32)]| -> Option<[u32; 2]> {
+                let c = run.len();
+                (c % 3 == 2).then(|| [run[c - 2].1, run[c - 1].1])
+            };
             let mut seen = vec![false; n];
             let mut flipped = 0usize;
             let mut stack: Vec<u32> = Vec::new();
@@ -4064,30 +4443,22 @@ pub mod nets {
                 seen[s] = true;
                 stack.push(s as u32);
                 group.clear();
-                // ① 沿**流形边**(恰好 2 个三角)洪泛,把组内绕向调成一致。
-                //    非流形边(>2)不定向 —— 在那里做决定会把错误沿整片传播,
-                //    实测不设此限时 10% 的三角被误翻、体积掉到 −53%。
+                // ① 沿**流形边**洪泛,把组内绕向调成一致(非流形边不跨越,同旧版)。
                 while let Some(ti) = stack.pop() {
                     group.push(ti);
                     let t = self.tris[ti as usize];
                     for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                        let key = if a < b {
-                            ((a as u64) << 32) | b as u64
-                        } else {
-                            ((b as u64) << 32) | a as u64
-                        };
                         let fwd = a < b;
-                        let Some(slot) = map.get(&key) else { continue };
-                        if slot[0] == EMPTY || slot[1] == EMPTY {
-                            continue;
-                        }
-                        for &packed in slot.iter() {
-                            let nt = packed >> 1;
-                            let nf = (packed & 1) == 1;
+                        let Some(slot) = slot_of(rows.run(a, b)) else { continue };
+                        for he in slot {
+                            let nt = he / 3;
+                            let k = (he % 3) as usize;
                             if nt == ti || seen[nt as usize] {
                                 continue;
                             }
                             seen[nt as usize] = true;
+                            let o = self.tris[nt as usize];
+                            let nf = o[k] < o[(k + 1) % 3];
                             if nf == fwd {
                                 self.tris[nt as usize].swap(1, 2);
                                 flipped += 1;
@@ -4246,24 +4617,49 @@ pub mod nets {
                 }
             });
             if fit_faces {
+                // P37:逐面采样(每面 3 次源面查询)并行;查询以 (2·max_step)² 作剪枝初值 —— 距离 ≤ max_step 时
+                // 结果与无界查询相同,超出时该面本就被跳过。累加仍按面序串行 ⟹ 与串行逐位一致。
+                let per_face: Vec<Option<([f64; 3], f64, [f64; 3])>> = {
+                    let (tris_ref, targets_ref): (&[[u32; 3]], &[[f32; 3]]) = (&self.tris, &targets);
+                    let chunk = tris_ref.len().div_ceil(nthreads()).max(1);
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> = tris_ref
+                            .chunks(chunk)
+                            .map(|part| {
+                                scope.spawn(move || {
+                                    part.iter()
+                                        .map(|&[a, b, c]| {
+                                            let [p, q, r] = [a, b, c].map(|i| g64(targets_ref[i as usize]));
+                                            let normal = cross3(sub(q, p), sub(r, p));
+                                            let area = len(normal);
+                                            if area == 0.0 {
+                                                return None;
+                                            }
+                                            let center = scale(add(add(p, q), r), 1.0 / 3.0);
+                                            let mut heights = [0.0; 3];
+                                            // (2/3, 1/6, 1/6) 的三个重心坐标给出二次精度的三角形积分。
+                                            // 每个残差按该样点的重心权重分回三个顶点，区分叶片上不对称的弯曲。
+                                            for (i, point) in [p, q, r].into_iter().enumerate() {
+                                                let sample = scale(add(center, point), 0.5);
+                                                let (distance, _, _, closest) =
+                                                    reference.closest_features_seeded(sample, 4.0 * max_step * max_step);
+                                                if distance > max_step {
+                                                    return None;
+                                                }
+                                                heights[i] = dot3(sub(closest, sample), normal) / area;
+                                            }
+                                            Some((normal, area, heights))
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                            })
+                            .collect();
+                        handles.into_iter().flat_map(|h| h.join().expect("面采样线程 panic")).collect()
+                    })
+                };
                 let mut weighted = vec![([0.0; 3], 0.0); self.verts.len()];
-                for &[a, b, c] in &self.tris {
-                    let [p, q, r] = [a, b, c].map(|i| g64(targets[i as usize]));
-                    let normal = cross3(sub(q, p), sub(r, p));
-                    let area = len(normal);
-                    if area == 0.0 { continue; }
-                    let center = scale(add(add(p, q), r), 1.0 / 3.0);
-                    let mut heights = [0.0; 3];
-                    let mut in_band = true;
-                    // (2/3, 1/6, 1/6) 的三个重心坐标给出二次精度的三角形积分。
-                    // 每个残差按该样点的重心权重分回三个顶点，区分叶片上不对称的弯曲。
-                    for (i, point) in [p, q, r].into_iter().enumerate() {
-                        let sample = scale(add(center, point), 0.5);
-                        let (distance, _, _, closest) = reference.closest_features(sample);
-                        in_band &= distance <= max_step;
-                        heights[i] = dot3(sub(closest, sample), normal) / area;
-                    }
-                    if !in_band { continue; }
+                for (&[a, b, c], res) in self.tris.iter().zip(&per_face) {
+                    let Some((normal, area, heights)) = *res else { continue };
                     let total: Real = heights.iter().sum();
                     for (corner, i) in [a, b, c].into_iter().enumerate() {
                         let (sum, weight) = &mut weighted[i as usize];
@@ -5535,6 +5931,179 @@ pub mod nets {
         }
 
         pub fn decimate_with_creases(&mut self, err2_max: f64, feature_deg: f64, target_tris: usize, creases: Option<&ReferenceCreases>) -> usize {
+            self.decimate_impl(err2_max, feature_deg, target_tris, creases, None, None, true, true)
+        }
+
+        /// P37:`decimate_with_creases` 的分段并行版(大网格)。按面质心沿最长轴切成 32 段(`ADF_DECIMATE_BLOCKS`),
+        /// 各段并行做 QEM(跨段顶点锁定、不清薄片、不压缩顶点);合并后只在接缝 2 环内再做一遍(其余顶点锁定),
+        /// 最后统一清薄片、压缩。段数固定 ⟹ 结果与线程数无关。< 40 万三角或设了 `ADF_DECIMATE_SERIAL` 时退回串行。
+        /// 与串行的差别只在接缝附近(接缝 2 环外各段内的塌缩次序与串行不同,但判据相同)。
+        pub fn decimate_with_creases_parallel(&mut self, err2_max: f64, feature_deg: f64, creases: Option<&ReferenceCreases>) -> usize {
+            let k: usize = std::env::var("ADF_DECIMATE_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
+            if k < 2 || self.tris.len() < 400_000 || std::env::var_os("ADF_DECIMATE_SERIAL").is_some() {
+                return self.decimate_with_creases(err2_max, feature_deg, 0, creases);
+            }
+            self.decimate_with_creases_blocks(err2_max, feature_deg, creases, k)
+        }
+
+        /// 分段并行 QEM 本体(无规模门槛,测试直接调用)。
+        pub fn decimate_with_creases_blocks(&mut self, err2_max: f64, feature_deg: f64, creases: Option<&ReferenceCreases>, k: usize) -> usize {
+            let (n, cross) = self.run_in_slabs(k.max(1), |m, lock| {
+                m.decimate_impl(err2_max, feature_deg, 0, creases, Some(lock), None, false, false)
+            });
+            let near = self.ring_expand(&cross, 2);
+            let lock: Vec<bool> = near.iter().map(|&b| !b).collect();
+            n + self.decimate_impl(err2_max, feature_deg, 0, creases, Some(lock.as_slice()), Some(near.as_slice()), true, true)
+        }
+
+        /// P37:按面质心沿最长轴切成 `k` 段(各段面数相近)。返回每段 (子网格, 子网格顶点 → 全局顶点号),
+        /// 以及"跨段"顶点标记(相邻面分属不止一段)。段内面保持全局升序,顶点按首次出现编号 ⟹ 确定性。
+        fn split_slabs(&self, k: usize) -> (Vec<(Mesh, Vec<u32>)>, Vec<bool>) {
+            let nt = self.tris.len();
+            let nv = self.verts.len();
+            let cen: Vec<[f64; 3]> = self
+                .tris
+                .iter()
+                .map(|t| {
+                    let p = t.map(|i| g64(self.verts[i as usize]));
+                    scale(add(add(p[0], p[1]), p[2]), 1.0 / 3.0)
+                })
+                .collect();
+            let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+            for c in &cen {
+                for a in 0..3 {
+                    lo[a] = lo[a].min(c[a]);
+                    hi[a] = hi[a].max(c[a]);
+                }
+            }
+            let ax = (0..3).max_by(|&x, &y| (hi[x] - lo[x]).total_cmp(&(hi[y] - lo[y]))).unwrap_or(0);
+            let mut order: Vec<u32> = (0..nt as u32).collect();
+            order.sort_by(|&a, &b| cen[a as usize][ax].total_cmp(&cen[b as usize][ax]).then(a.cmp(&b)));
+            let mut block = vec![0u32; nt];
+            for (r, &f) in order.iter().enumerate() {
+                block[f as usize] = ((r as u64 * k as u64) / nt.max(1) as u64) as u32;
+            }
+            drop(order);
+            drop(cen);
+            let mut owner = vec![u32::MAX; nv];
+            let mut cross = vec![false; nv];
+            let mut faces: Vec<Vec<u32>> = vec![Vec::new(); k];
+            for (f, t) in self.tris.iter().enumerate() {
+                let b = block[f];
+                faces[b as usize].push(f as u32);
+                for &v in t {
+                    let o = &mut owner[v as usize];
+                    if *o == u32::MAX {
+                        *o = b;
+                    } else if *o != b {
+                        cross[v as usize] = true;
+                    }
+                }
+            }
+            let mut local = vec![u32::MAX; nv];
+            let mut parts = Vec::with_capacity(k);
+            for fs in faces {
+                let mut verts: Vec<[f32; 3]> = Vec::new();
+                let mut gid: Vec<u32> = Vec::new();
+                let mut tris: Vec<[u32; 3]> = Vec::with_capacity(fs.len());
+                for &f in &fs {
+                    let t = self.tris[f as usize];
+                    let mut lt = [0u32; 3];
+                    for (k2, &v) in t.iter().enumerate() {
+                        if local[v as usize] == u32::MAX {
+                            local[v as usize] = verts.len() as u32;
+                            verts.push(self.verts[v as usize]);
+                            gid.push(v);
+                        }
+                        lt[k2] = local[v as usize];
+                    }
+                    tris.push(lt);
+                }
+                for &g in &gid {
+                    local[g as usize] = u32::MAX;
+                }
+                parts.push((Mesh { verts, tris }, gid));
+            }
+            (parts, cross)
+        }
+
+        /// P37:切成 `k` 段,在每段上并行执行 `f(子网格, 跨段顶点锁)`,再按段序合并。
+        /// 约定:`f` 不得压缩、增加顶点,不得移动加锁顶点(合并按子网格顶点号映射回全局号)。
+        /// 合并后被塌缩掉的顶点留作孤点,由后续带压缩的一遍清除。返回 (各段返回值之和, 跨段标记)。
+        fn run_in_slabs<F>(&mut self, k: usize, f: F) -> (usize, Vec<bool>)
+        where
+            F: Fn(&mut Mesh, &[bool]) -> usize + Sync,
+        {
+            let (parts, cross) = self.split_slabs(k);
+            let slots: Vec<std::sync::Mutex<Option<(Mesh, Vec<u32>, usize)>>> =
+                parts.into_iter().map(|(m, g)| std::sync::Mutex::new(Some((m, g, 0)))).collect();
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let workers = nthreads().min(slots.len()).max(1);
+            {
+                let (slots, next, cross, f) = (&slots, &next, &cross, &f);
+                std::thread::scope(|sc| {
+                    for _ in 0..workers {
+                        sc.spawn(move || loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= slots.len() {
+                                break;
+                            }
+                            let mut slot = slots[i].lock().expect("段锁中毒");
+                            if let Some((m, g, n)) = slot.as_mut() {
+                                let lock: Vec<bool> = g.iter().map(|&v| cross[v as usize]).collect();
+                                *n = f(m, &lock);
+                            }
+                        });
+                    }
+                });
+            }
+            let mut total = 0usize;
+            let mut tris = Vec::with_capacity(self.tris.len());
+            for slot in slots {
+                let (m, g, n) = slot.into_inner().expect("段锁中毒").expect("段结果缺失");
+                assert_eq!(m.verts.len(), g.len(), "分段处理不得增删顶点");
+                total += n;
+                for (i, &v) in g.iter().enumerate() {
+                    if !cross[v as usize] {
+                        self.verts[v as usize] = m.verts[i];
+                    }
+                }
+                tris.extend(m.tris.iter().map(|t| t.map(|i| g[i as usize])));
+            }
+            self.tris = tris;
+            (total, cross)
+        }
+
+        /// 标记 `mark` 及其 `rings` 环邻域内的顶点。
+        fn ring_expand(&self, mark: &[bool], rings: usize) -> Vec<bool> {
+            let mut cur = mark.to_vec();
+            for _ in 0..rings {
+                let prev = cur.clone();
+                for t in &self.tris {
+                    if t.iter().any(|&v| prev[v as usize]) {
+                        for &v in t {
+                            cur[v as usize] = true;
+                        }
+                    }
+                }
+            }
+            cur
+        }
+
+        /// QEM 本体。`locked`:端点被锁的边不塌缩;`seed`:初始堆只放至少一端被标记的边(塌缩后邻边照常入堆);
+        /// `slivers`:末尾清薄片;`compact`:压缩掉孤立顶点(为假时顶点号不变,只删死面)。
+        #[allow(clippy::too_many_arguments)]
+        fn decimate_impl(
+            &mut self,
+            err2_max: f64,
+            feature_deg: f64,
+            target_tris: usize,
+            creases: Option<&ReferenceCreases>,
+            locked: Option<&[bool]>,
+            seed: Option<&[bool]>,
+            slivers: bool,
+            compact: bool,
+        ) -> usize {
             let mut keep = creases.map(|g| self.crease_targets(g, err2_max.sqrt().max(0.04 * g.radius)));
             // 脊线(二面角>25°)的合并上限:**与 err2 解耦**。阶梯合并代价由
             // 采样步长决定(~2.5e-3 mm² @ h≈0.1),把它绑在 err2 上意味着
@@ -5765,6 +6334,9 @@ pub mod nets {
                         if !seen.insert(key) {
                             continue;
                         }
+                        if seed.is_some_and(|sd| !(sd[a as usize] || sd[b as usize])) {
+                            continue;
+                        }
                         let (c, _) = edge_cost(
                             &q[a as usize],
                             &q[b as usize],
@@ -5795,6 +6367,9 @@ pub mod nets {
                 }
                 if ver[a as usize] != va || ver[b as usize] != vb {
                     continue; // 懒失效
+                }
+                if locked.is_some_and(|l| l[a as usize] || l[b as usize]) {
+                    continue; // P37:跨段/接缝外顶点锁定
                 }
                 if keep.as_ref().is_some_and(|v| v[a as usize].is_some() && v[b as usize].is_some()) { continue; }
                 if n_live <= target_tris && target_tris > 0 {
@@ -6050,6 +6625,18 @@ pub mod nets {
                 }
             }
             // ── 6) 压缩 ──
+            if !compact {
+                // P37 分段模式:顶点号不变,只删死面与退化面
+                let mut newt: Vec<[u32; 3]> = Vec::with_capacity(n_live);
+                for (ti, t) in self.tris.iter().enumerate() {
+                    if dead_tri[ti] || t[0] == t[1] || t[1] == t[2] || t[0] == t[2] {
+                        continue;
+                    }
+                    newt.push(*t);
+                }
+                self.tris = newt;
+                return n_collapsed;
+            }
             let mut remap: Vec<u32> = vec![u32::MAX; nv];
             let mut newv: Vec<[f32; 3]> = Vec::new();
             let mut newt: Vec<[u32; 3]> = Vec::with_capacity(n_live);
@@ -6079,7 +6666,9 @@ pub mod nets {
             // ── 7) 薄片收尾清理:塌缩链会挤出新薄片(高度≈0,法线随机),
             // f32 导出后部分退化为纯线段——查看器把它们画成表面短黑线
             // (实测 9 个 f32 零面积 + 2733 个高度<0.005mm)。按最短边塌缩。
-            n_collapsed += self.collapse_slivers(0.02, 6);
+            if slivers {
+                n_collapsed += self.collapse_slivers(0.02, 6);
+            }
             n_collapsed
         }
 
@@ -6406,6 +6995,10 @@ pub mod nets {
         /// 返回(丢弃的分量数, 丢弃的三角数)。
         pub fn drop_small_components(&mut self, min_tris: usize, min_vol_frac: f64) -> (usize, usize) {
             let n = self.tris.len();
+            // P40:CSR 边表 + 数组计数代替 HashMap。旧版:每条边首次出现记下面,后续出现与首面合并 ——
+            // 这里对每条边的出现序列同样"全部并入首面",连通分量划分相同;体积按面序累加(与旧版同序),
+            // 判定与返回值逐位一致。
+            let rows = edge_rows(&self.tris, self.verts.len());
             let mut par: Vec<u32> = (0..n as u32).collect();
             fn find(p: &mut [u32], mut x: u32) -> u32 {
                 while p[x as usize] != x {
@@ -6414,74 +7007,81 @@ pub mod nets {
                 }
                 x
             }
-            let mut edge: std::collections::HashMap<u64, u32, FxBuild> =
-                std::collections::HashMap::with_capacity_and_hasher(n * 3, FxBuild);
-            for (ti, t) in self.tris.iter().enumerate() {
-                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                    let key = if a < b {
-                        ((a as u64) << 32) | b as u64
-                    } else {
-                        ((b as u64) << 32) | a as u64
-                    };
-                    if let Some(&other) = edge.get(&key) {
-                        let x = find(&mut par, ti as u32);
-                        let y = find(&mut par, other);
+            for r in 0..self.verts.len() {
+                let row = &rows.ent[rows.start[r] as usize..rows.start[r + 1] as usize];
+                let mut a = 0usize;
+                while a < row.len() {
+                    let mut b = a + 1;
+                    while b < row.len() && row[b].0 == row[a].0 {
+                        let x = find(&mut par, row[b].1 / 3);
+                        let y = find(&mut par, row[a].1 / 3);
                         if x != y {
                             par[y as usize] = x;
                         }
-                    } else {
-                        edge.insert(key, ti as u32);
+                        b += 1;
                     }
+                    a = b;
                 }
             }
-            let mut count: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
-            let mut vols: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+            drop(rows);
+            let face_vol: Vec<f64> = {
+                let (tris, verts) = (&self.tris, &self.verts);
+                let chunk = n.div_ceil(nthreads()).max(1);
+                std::thread::scope(|scope| {
+                    let hs: Vec<_> = tris
+                        .chunks(chunk)
+                        .map(|part| {
+                            scope.spawn(move || {
+                                part.iter()
+                                    .map(|t| {
+                                        let (a, b, c) = (verts[t[0] as usize], verts[t[1] as usize], verts[t[2] as usize]);
+                                        let (ax, ay, az) = (a[0] as f64, a[1] as f64, a[2] as f64);
+                                        let (bx, by, bz) = (b[0] as f64, b[1] as f64, b[2] as f64);
+                                        let (cx, cy, cz) = (c[0] as f64, c[1] as f64, c[2] as f64);
+                                        (ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx) + az * (bx * cy - by * cx)) / 6.0
+                                    })
+                                    .collect::<Vec<f64>>()
+                            })
+                        })
+                        .collect();
+                    hs.into_iter().flat_map(|h| h.join().expect("体积线程 panic")).collect()
+                })
+            };
+            let root: Vec<u32> = (0..n as u32).map(|f| find(&mut par, f)).collect();
+            drop(par);
+            let mut count = vec![0u32; n];
+            let mut vols = vec![0.0f64; n];
             let mut total_vol = 0.0f64;
-            for ti in 0..n {
-                let r = find(&mut par, ti as u32);
-                *count.entry(r).or_insert(0) += 1;
-                let t = self.tris[ti];
-                let (a, b, c) = (
-                    self.verts[t[0] as usize],
-                    self.verts[t[1] as usize],
-                    self.verts[t[2] as usize],
-                );
-                let (ax, ay, az) = (a[0] as f64, a[1] as f64, a[2] as f64);
-                let (bx, by, bz) = (b[0] as f64, b[1] as f64, b[2] as f64);
-                let (cx, cy, cz) = (c[0] as f64, c[1] as f64, c[2] as f64);
-                let v = (ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx)
-                    + az * (bx * cy - by * cx))
-                    / 6.0;
-                *vols.entry(r).or_insert(0.0) += v;
-                total_vol += v;
+            for f in 0..n {
+                let r = root[f] as usize;
+                count[r] += 1;
+                vols[r] += face_vol[f];
+                total_vol += face_vol[f];
             }
             let total_vol = total_vol.abs();
-            let mut drop = vec![false; n];
+            let mut drop_face = vec![false; n];
+            let mut dropped_root = vec![false; n];
             let (mut nd, mut nt) = (0usize, 0usize);
-            for ti in 0..n {
-                let r = find(&mut par, ti as u32);
-                let small = count[&r] < min_tris
-                    || vols[&r].abs() < min_vol_frac * total_vol;
-                if small {
-                    drop[ti] = true;
+            for f in 0..n {
+                let r = root[f] as usize;
+                if (count[r] as usize) < min_tris || vols[r].abs() < min_vol_frac * total_vol {
+                    drop_face[f] = true;
                     nt += 1;
+                    if !dropped_root[r] {
+                        dropped_root[r] = true;
+                        nd += 1;
+                    }
                 }
             }
             if nt > 0 {
                 let mut i = 0usize;
                 self.tris.retain(|_| {
-                    let keep = !drop[i];
+                    let keep = !drop_face[i];
                     i += 1;
                     keep
                 });
-                // 统计丢了几个分量
-                let mut dropped_roots = std::collections::HashSet::new();
-                for ti in 0..n {
-                    if drop[ti] {
-                        dropped_roots.insert(find(&mut par, ti as u32));
-                    }
-                }
-                nd = dropped_roots.len();
+            } else {
+                nd = 0;
             }
             (nd, nt)
         }
@@ -6751,6 +7351,73 @@ pub mod nets {
         add(mass, scale(delta, limit.max(0.0) * 0.999))
     }
 
+    /// P39:把 k ∈ [k0, k1) 层格点的 ADF 值按叶写入 `out`(布局 (k−k0)·plane + j·dx + i)。
+    /// `qs[a]` 是 a 轴格点坐标(已按 eval 的方式钳位,单调不减)。节点 = 格点集合
+    /// {q : lo ≤ q < hi}(逐轴),lo/hi 是祖先的分割阈值 o+s/2 —— 与 eval 下探时的判据相同,
+    /// 因此每个格点恰好落在 eval 会走到的那片叶里。
+    fn raster_leaves(adf: &Adf, qs: &[Vec<Real>; 3], k0: usize, k1: usize, dx: usize, plane: usize, out: &mut [f32]) {
+        if k0 >= k1 {
+            return;
+        }
+        struct Frame {
+            idx: u32,
+            o: [Real; 3],
+            s: Real,
+            lo: [Real; 3],
+            hi: [Real; 3],
+        }
+        let range = |a: usize, lo: Real, hi: Real| -> (usize, usize) {
+            let q = &qs[a];
+            (q.partition_point(|&v| v < lo), q.partition_point(|&v| v < hi))
+        };
+        let mut stack = vec![Frame {
+            idx: adf.root,
+            o: adf.min,
+            s: adf.size,
+            lo: [Real::NEG_INFINITY; 3],
+            hi: [Real::INFINITY; 3],
+        }];
+        while let Some(f) = stack.pop() {
+            let (xs, xe) = range(0, f.lo[0], f.hi[0]);
+            let (ys, ye) = range(1, f.lo[1], f.hi[1]);
+            let (zs, ze) = range(2, f.lo[2], f.hi[2]);
+            let (zs, ze) = (zs.max(k0), ze.min(k1));
+            if xs >= xe || ys >= ye || zs >= ze {
+                continue;
+            }
+            match &adf.nodes[f.idx as usize] {
+                Node::Leaf(c) => {
+                    for k in zs..ze {
+                        let uz = (qs[2][k] - f.o[2]) / f.s;
+                        for j in ys..ye {
+                            let uy = (qs[1][j] - f.o[1]) / f.s;
+                            let row = (k - k0) * plane + j * dx;
+                            for i in xs..xe {
+                                let ux = (qs[0][i] - f.o[0]) / f.s;
+                                out[row + i] = trilinear([ux, uy, uz], c);
+                            }
+                        }
+                    }
+                }
+                Node::Internal(ch) => {
+                    let h = f.s * 0.5;
+                    for (ci, &child) in ch.iter().enumerate() {
+                        let (mut lo, mut hi) = (f.lo, f.hi);
+                        for a in 0..3 {
+                            let t = f.o[a] + h;
+                            if (ci >> a) & 1 == 1 {
+                                lo[a] = lo[a].max(t);
+                            } else {
+                                hi[a] = hi[a].min(t);
+                            }
+                        }
+                        stack.push(Frame { idx: child, o: child_origin(f.o, f.s, ci), s: h, lo, hi });
+                    }
+                }
+            }
+        }
+    }
+
     fn extract_region(
         adf: &Adf,
         n: usize,
@@ -6767,31 +7434,34 @@ pub mod nets {
         //    逐点纯函数、与访问顺序无关 → 按 k 平面切带并行,结果逐位可复现。
         //    dim³ 次 eval 是本函数的主要成本(桌腿 513³≈1.35 亿次,占提取耗时 ~85%);
         //    串行时 4.0s,串行也是它把 extract 顶成全管线最大单项。
+        let t_all = std::time::Instant::now();
         let mut vals = vec![0f32; dx * dy * dz];
         {
             let plane = dx * dy;
             let ppw = dz.div_ceil(nthreads()).max(1);
             let band = ppw * plane;
             let chunks: Vec<&mut [f32]> = vals.chunks_mut(band).collect();
-            let min = adf.min;
+            // P39:按叶光栅化代替逐点 `adf.eval`。逐点 eval 每次从根下探 ~11 层(指针追逐、缓存不命中),
+            // 翅膀 depth 11 要做 25.8 亿次。这里每个线程对自己的 k 层段做一次八叉树 DFS,叶内格点直接三线性。
+            // 坐标表达式、钳位(clamp_to_domain)、子格归属(child_index 的同一阈值 o+s/2)、叶内坐标
+            // u=(q−o)/s 与 eval 完全相同 ⟹ 每个格点的值与 eval **逐位一致**。
+            let (min, size) = (adf.min, adf.size);
+            let axis_q = |a: usize, n_pts: usize| -> Vec<Real> {
+                (0..n_pts)
+                    .map(|i| clamp(min[a] + (offset[a] + i) as Real * step, min[a], min[a] + size - 1e-9))
+                    .collect()
+            };
+            let qs = [axis_q(0, dx), axis_q(1, dy), axis_q(2, dz)];
+            let qs = &qs;
             std::thread::scope(|sc| {
                 for (w, chunk) in chunks.into_iter().enumerate() {
                     let k0 = w * ppw;
-                    sc.spawn(move || {
-                        for (idx, slot) in chunk.iter_mut().enumerate() {
-                            let k = k0 + idx / plane;
-                            let rem = idx % plane;
-                            let (j, i) = (rem / dx, rem % dx);
-                            *slot = adf.eval([
-                                min[0] + (offset[0] + i) as Real * step,
-                                min[1] + (offset[1] + j) as Real * step,
-                                min[2] + (offset[2] + k) as Real * step,
-                            ]);
-                        }
-                    });
+                    let k1 = (k0 + ppw).min(dz);
+                    sc.spawn(move || raster_leaves(adf, qs, k0, k1, dx, plane, chunk));
                 }
             });
         }
+        let t_sample = t_all.elapsed();
 
         // 2) 变号 cell 每片表面一个顶点 = 该片 12 棱交叉点的 QEF 最小二乘
         //    按 ck 切 k 平面并行:每片产出**局部**顶点号写入本片 cell_vert,
@@ -7099,6 +7769,7 @@ pub mod nets {
                 verts.append(&mut loc);
             }
         }
+        let t_verts = t_all.elapsed();
         // 3) 网格棱变号 → 环绕该棱的 4 个 cell 顶点连 quad(push_quad 自定向)
         //    串行顺序 = 全 x 向 → 全 y 向 → 全 z 向;每向内部 k 递增。
         //    因此每向按 k 切片并行、再按片序合并,三角顺序与串行**逐位一致**。
@@ -7147,11 +7818,20 @@ pub mod nets {
             }
         }
 
+        let t_quads = t_all.elapsed();
         let mut mesh = Mesh { verts, tris };
         // 绕向统一:个别 quad 会因场值不稳而定向相反,背面剔除的渲染器会显示成
         // 斑点状的"洞"。见 Mesh::orient_consistently 的说明。
         let flipped = mesh.orient_consistently();
         eprintln!("[nets.winding] 翻正 {flipped} 个三角(绕向一致化)");
+        let t_end = t_all.elapsed();
+        eprintln!(
+            "[nets.time] 采样 {:.1}s | 顶点 {:.1}s | 组装 {:.1}s | 绕向 {:.1}s",
+            t_sample.as_secs_f64(),
+            (t_verts - t_sample).as_secs_f64(),
+            (t_quads - t_verts).as_secs_f64(),
+            (t_end - t_quads).as_secs_f64()
+        );
         mesh
     }
 
@@ -9199,6 +9879,140 @@ mod tests {
         let (hit, _) = mesh.edge_plane([0.5, 0.0, 0.0], 0, 0.0, 1.0).expect("finite edge intersects x=0.8");
         assert!((hit[0] - 0.8).abs() < 1e-10);
         assert!(mesh.edge_plane([0.5, 0.0, 0.0], 0, 0.0, 0.7).is_none());
+    }
+
+    /// P40:CSR 边表版的绕向统一 / 碎屑清理:细分立方体随机翻转部分面后应恢复一致绕向且体积为正;
+    /// 外加一个远处的小四面体,碎屑清理应只丢掉它。
+    #[test]
+    fn csr_orient_and_debris_cleanup() {
+        let n = 6i32;
+        let mut idx = std::collections::HashMap::<[i32; 3], u32>::new();
+        let mut verts: Vec<[f32; 3]> = Vec::new();
+        let mut tris: Vec<[u32; 3]> = Vec::new();
+        for ax in 0..3 {
+            let (u, v) = ((ax + 1) % 3, (ax + 2) % 3);
+            for s in [0, n] {
+                for i in 0..n {
+                    for j in 0..n {
+                        let mut ids = [0u32; 4];
+                        for (c, (di, dj)) in [(0, 0), (1, 0), (1, 1), (0, 1)].into_iter().enumerate() {
+                            let mut q = [0i32; 3];
+                            q[ax] = s;
+                            q[u] = i + di;
+                            q[v] = j + dj;
+                            ids[c] = *idx.entry(q).or_insert_with(|| {
+                                verts.push(q.map(|x| x as f32));
+                                (verts.len() - 1) as u32
+                            });
+                        }
+                        if s == n {
+                            tris.push([ids[0], ids[1], ids[2]]);
+                            tris.push([ids[0], ids[2], ids[3]]);
+                        } else {
+                            tris.push([ids[0], ids[2], ids[1]]);
+                            tris.push([ids[0], ids[3], ids[2]]);
+                        }
+                    }
+                }
+            }
+        }
+        let n_cube = tris.len();
+        for (f, t) in tris.iter_mut().enumerate() {
+            if f % 7 == 3 {
+                t.swap(1, 2);
+            }
+        }
+        let b = verts.len() as u32;
+        verts.extend([[100.0, 0.0, 0.0], [100.1, 0.0, 0.0], [100.0, 0.1, 0.0], [100.0, 0.0, 0.1]]);
+        tris.extend([[b, b + 2, b + 1], [b, b + 1, b + 3], [b, b + 3, b + 2], [b + 1, b + 2, b + 3]]);
+        let mut m = nets::Mesh { verts, tris };
+        let flipped = m.orient_consistently();
+        assert!(flipped > 0);
+        let mut dir = std::collections::HashMap::<(u32, u32), i32>::new();
+        for t in &m.tris {
+            for k in 0..3 {
+                *dir.entry((t[k], t[(k + 1) % 3])).or_insert(0) += 1;
+            }
+        }
+        for (&(a, c), &cnt) in &dir {
+            assert_eq!(cnt, 1, "有向边重复 {a}->{c}:绕向未统一");
+            assert!(dir.contains_key(&(c, a)), "缺反向边 {c}->{a}");
+        }
+        assert!(m.signed_volume() > 0.0, "整体朝向应向外");
+        let (nd, nt) = m.drop_small_components(50, 1e-4);
+        assert_eq!((nd, nt), (1, 4), "应只丢掉小四面体");
+        assert_eq!(m.tris.len(), n_cube);
+    }
+
+    /// P37:分段并行 QEM / 源网格简化在细分立方体(闭合流形、90° 折痕)上:体积不变、各面仍轴对齐、确实简化。
+    #[test]
+    fn slab_parallel_decimation_keeps_a_subdivided_cube() {
+        fn cube(n: i32) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
+            let mut idx = std::collections::HashMap::<[i32; 3], u32>::new();
+            let mut verts: Vec<[f32; 3]> = Vec::new();
+            let mut tris = Vec::new();
+            for ax in 0..3 {
+                let (u, v) = ((ax + 1) % 3, (ax + 2) % 3);
+                for s in [0, n] {
+                    for i in 0..n {
+                        for j in 0..n {
+                            let mut ids = [0u32; 4];
+                            for (c, (di, dj)) in [(0, 0), (1, 0), (1, 1), (0, 1)].into_iter().enumerate() {
+                                let mut q = [0i32; 3];
+                                q[ax] = s;
+                                q[u] = i + di;
+                                q[v] = j + dj;
+                                ids[c] = *idx.entry(q).or_insert_with(|| {
+                                    verts.push(q.map(|x| x as f32 / n as f32));
+                                    (verts.len() - 1) as u32
+                                });
+                            }
+                            if s == n {
+                                tris.push([ids[0], ids[1], ids[2]]);
+                                tris.push([ids[0], ids[2], ids[3]]);
+                            } else {
+                                tris.push([ids[0], ids[2], ids[1]]);
+                                tris.push([ids[0], ids[3], ids[2]]);
+                            }
+                        }
+                    }
+                }
+            }
+            (verts, tris)
+        }
+        let check = |m: &nets::Mesh, n0: usize, what: &str| {
+            let mut vol = 0.0;
+            for t in &m.tris {
+                let [a, b, c] = t.map(|i| m.verts[i as usize].map(|x| x as Real));
+                let (u, v) = (sub(b, a), sub(c, a));
+                let nn = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+                let l = (nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]).sqrt();
+                assert!(l > 0.0 && nn.iter().any(|x| x.abs() / l > 0.999), "{what}: 面不再轴对齐 {nn:?}");
+                vol += a[0] * nn[0] + a[1] * nn[1] + a[2] * nn[2];
+            }
+            assert!((vol / 6.0 - 1.0).abs() < 1e-4, "{what}: 体积 {}", vol / 6.0);
+            assert!(m.tris.len() * 2 < n0, "{what}: 简化不足 {} / {n0}", m.tris.len());
+            let (open, nonman, _) = m.edge_stats();
+            assert_eq!((open, nonman), (0, 0), "{what}: 拓扑损坏");
+        };
+        let (verts, tris) = cube(12);
+        let n0 = tris.len();
+        let mut a = nets::Mesh { verts: verts.clone(), tris: tris.clone() };
+        a.decimate_with_creases_blocks(1e-4, 25.0, None, 4);
+        check(&a, n0, "QEM 分段");
+        let (sv, st) = cube(1);
+        let source = meshfield::MeshField::new(
+            st.iter().map(|t| t.map(|i| sv[i as usize].map(|x| x as Real))).collect(),
+        );
+        let creases = nets::ReferenceCreases::new(&source, 0.4, 35.0);
+        let mut b = nets::Mesh { verts, tris };
+        b.decimate_to_reference_blocks(&source, &creases, 0.01, 0.005, 4);
+        check(&b, n0, "源网格简化 分段");
+        // P38:分段交替收尾 / 分段视觉清理不得破坏闭合性与贴面
+        b.alternate_crease_cleanup_blocks(&source, &creases, 0.01, 1.0 / 12.0, 4);
+        check(&b, n0, "交替收尾 分段");
+        b.clean_visual_spurs_blocks(&source, 2, 4);
+        check(&b, n0, "视觉清理 分段");
     }
 
     /// P33:平面上一个微斜面(顶点抬起 0.003mm、离邻顶点 0.01mm)造成的 > 20° 多余线应被塌缩掉。

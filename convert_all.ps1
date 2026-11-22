@@ -1,8 +1,9 @@
 # Batch ADF round-trip for every STL in .\stls  ->  .\out\<name>.stl + .\out\<name>.log
 # Usage (from the project folder):  powershell -ExecutionPolicy Bypass -File .\convert_all.ps1
-# Optional: -HTarget 0.1  -Only "flower" (substring filter)  -MaxDepth 11 (finer cells for parts > 200mm, ~4x memory)
-param([double]$HTarget = 0.1, [string]$Only = "", [int]$MaxDepth = 10)
+# Optional: -HTarget 0.1  -Only "flower" (substring filter)  -MaxDepth 11 (finer cells for parts > 200mm, ~4x memory)  -Tol 0.02 (max deviation mm; 0.01 = finest, larger = smaller file)
+param([double]$HTarget = 0.1, [string]$Only = "", [int]$MaxDepth = 10, [double]$Tol = 0.02)
 $env:ADF_MAX_DEPTH = "$MaxDepth"
+$env:ADF_REF_TOL = "$Tol"
 $ErrorActionPreference = "Continue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Set-Location $PSScriptRoot
@@ -21,7 +22,7 @@ Get-ChildItem stls -File | Where-Object { $_.Extension -ieq ".stl" -and $_.Name 
     $code = $LASTEXITCODE
     $sw.Stop()
     $size = if (Test-Path $out) { [math]::Round((Get-Item $out).Length / 1MB, 2) } else { -1 }
-    $line = "{0}`t{1}`texit={2}`t{3:n1}s`tin={4:n2}MB`tout={5}MB" -f $name, $HTarget, $code, $sw.Elapsed.TotalSeconds, ($_.Length / 1MB), $size
+    $line = "{0}`th={1} tol={6} depth={7}`texit={2}`t{3:n1}s`tin={4:n2}MB`tout={5}MB" -f $name, $HTarget, $code, $sw.Elapsed.TotalSeconds, ($_.Length / 1MB), $size, $Tol, $MaxDepth
     Add-Content -Path $log -Value "[batch] $line"
     $summary += $line
 }
