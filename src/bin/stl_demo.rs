@@ -175,8 +175,11 @@ fn main() {
     }
 
     // ── 7) Surface Nets 提取 + STL 导出 + 体积对账 ──
-    // 提取格宽倍率:环境变量可覆盖(实验用;默认 2×h_min)
-    let hf_mult: Real = std::env::var("ADF_H_EXT").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
+    // 提取格宽倍率:环境变量可覆盖(实验用)。默认 1×h_min —— 与 stl_roundtrip 交付档一致。
+    // P21 已证明 mult=2 会把直角缘变成锯齿带(锐边顶点占比 5.9%→11.8%),用收紧 err2
+    // 补三角数无效;P23 多角度渲染在切削演示上复现了同一现象,故默认改回 1。
+    // 需要更快的预览可设 ADF_H_EXT=2。
+    let hf_mult: Real = std::env::var("ADF_H_EXT").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let h_ext = h_min * hf_mult;
     let t = Instant::now();
     let mut mesh = nets::extract_uniform(&adf, h_ext);
@@ -216,6 +219,12 @@ fn main() {
             t.elapsed(),
             mesh.tris.len()
         );
+        // 简化把凸曲面顶点按弦高内缩(P21);roundtrip 的场后处理路径早已做这一步,
+        // 切削演示漏掉了 —— 刀路圆柱面/轮毂球面上表现为多段内凹折线。ADF_NO_PROJ=1 可关。
+        if std::env::var("ADF_NO_PROJ").is_err() {
+            let (pm, px) = mesh.project_to_zero(&adf, 3, h_ext as f64);
+            println!("[project] 首轮位移 mean {pm:.4} max {px:.4} mm");
+        }
         // 脊线重吸附(消除锐边锯齿阶梯的短黑线;见 stl_roundtrip 注释)
         if std::env::var("ADF_NO_SNAP2").is_err() {
             let ns = mesh.snap_sharp_to_rim(&adf, 0.5, 0.95);

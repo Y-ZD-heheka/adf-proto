@@ -1284,7 +1284,10 @@ fn build_cell_rebuild(
         let mut ch = [0u32; 8];
         let hs = s * 0.5;
         for i in 0..8 {
-            ch[i] = build_cell_rebuild(nodes, sd, child_origin(o, s, i), hs, depth + 1, eps, band, max_depth, stats);
+            // 内层子索引必须打 LOCAL_TAG:本函数只在 refresh_walk 的局部 vec
+            // 里建子树,未打标的索引在合并阶段会被当成既有全局索引 → 指向域角落
+            // 的远场空气叶,刀路穿过粗叶时会把假空气接进材料(P23 根因)。
+            ch[i] = tag_local(build_cell_rebuild(nodes, sd, child_origin(o, s, i), hs, depth + 1, eps, band, max_depth, stats));
         }
         nodes.push(Node::Internal(ch));
     } else {
@@ -2125,7 +2128,10 @@ impl Adf {
         let t_write = std::time::Instant::now();
         let mut corrected = 0u64;
         let gmax = [gmin[0] + (nx - 1) as Real * h, gmin[1] + (ny - 1) as Real * h, gmin[2] + (nz - 1) as Real * h];
-        Self::writeback_walk(&mut self.nodes, self.root, self.min, self.size, gmin, gmax, h, gn, &d, &mut corrected);
+        Self::writeback_walk(
+            &mut self.nodes, self.root, self.min, self.size, gmin, gmax, h, gn, &d,
+            &self.field.cuts, &mut corrected,
+        );
         st.corrected = corrected;
         st.t_write = t_write.elapsed();
         st
@@ -2186,6 +2192,7 @@ impl Adf {
         h: Real,
         gn: [usize; 3],
         d: &[f32],
+        cuts: &[Capsule],
         corrected: &mut u64,
     ) {
         if !aabb_overlap(o, s, gmin, gmax) {
@@ -2198,6 +2205,18 @@ impl Adf {
                         let p = corner_pos(o, s, k);
                         if c[k] <= 0.5 * h as f32 {
                             continue; // 界面邻域/材料侧:保持(材料区恒精确)
+                        }
+                        // 精确性判据(P23):空气角点旧值 v 若不大于到所有刀路的距离,
+                        // 则它是精确距离,不需要也不应被 EDT 覆盖。证明:v = base(p),
+                        // 原表面最近点 q 满足 |p−q| = v;对每条刀路 cap.sd(q) ≥
+                        // cap.sd(p) − v ≥ 0,即 q 未被切掉,新表面距离 ≤ v;而切削只
+                        // 减少材料,距离只增不减 ⟹ 恰为 v。
+                        // 不加此判据时,刀路 AABB 并集(贯穿件的长胶囊 = 整片厚板)内
+                        // 所有原始表面的空气角点都会被 EDT 的种子离散化值(±0.25–1 格)
+                        // 覆盖,三线性零面随之漂移 —— 远离刀路的原始表面出现"橘皮"。
+                        let cut_dist = cuts.iter().map(|cap| cap.sd(p)).fold(Real::INFINITY, Real::min);
+                        if (c[k] as Real) <= cut_dist {
+                            continue;
                         }
                         let g: [isize; 3] = [
                             ((p[0] - gmin[0]) / h).round() as isize,
@@ -2224,7 +2243,7 @@ impl Adf {
             }
             Node::Internal(ch) => {
                 for i in 0..8 {
-                    Self::writeback_walk(nodes, ch[i], child_origin(o, s, i), s * 0.5, gmin, gmax, h, gn, d, corrected);
+                    Self::writeback_walk(nodes, ch[i], child_origin(o, s, i), s * 0.5, gmin, gmax, h, gn, d, cuts, corrected);
                 }
             }
         }
@@ -3453,7 +3472,57 @@ pub mod nets {
                     sharp[key.1 as usize] = true;
                 }
             }
-            // 4) 强吸附
+            // 4) 强吸附(P23:翻转守卫 + 缘线存活判据)
+            //    ① 翻转守卫:旧版无任何守卫,平盘面/孔口处锐边顶点被拉过对边,整片
+            //       三角 180° 翻面(叶轮底盘 617 对折叠中 88% 法线完全反向)。现要求
+            //       每个邻面法线转角 ≤60°,否则步长减半重试(至多 4 次),仍不行则放弃。
+            //    ② 缘线存活:切削后被挖掉的原始缘线不在当前零面上(eval ≫ 0),不再
+            //       吸引新加工面上的点。要求目标 |eval| ≤ 0.5·h_min;无切削时不受影响。
+            fn snap_keeps_orientation(
+                verts: &[[f32; 3]],
+                tris: &[[u32; 3]],
+                ring: &[u32],
+                vi: usize,
+                cand: [f64; 3],
+            ) -> bool {
+                for &ti in ring {
+                    let t = tris[ti as usize];
+                    let mut po = [[0.0f64; 3]; 3];
+                    let mut pn = [[0.0f64; 3]; 3];
+                    for k in 0..3 {
+                        let w = t[k] as usize;
+                        let p = verts[w];
+                        po[k] = [p[0] as f64, p[1] as f64, p[2] as f64];
+                        pn[k] = if w == vi { cand } else { po[k] };
+                    }
+                    let crs = |q: &[[f64; 3]; 3]| -> [f64; 3] {
+                        let ab = [q[1][0] - q[0][0], q[1][1] - q[0][1], q[1][2] - q[0][2]];
+                        let ac = [q[2][0] - q[0][0], q[2][1] - q[0][1], q[2][2] - q[0][2]];
+                        [
+                            ab[1] * ac[2] - ab[2] * ac[1],
+                            ab[2] * ac[0] - ab[0] * ac[2],
+                            ab[0] * ac[1] - ab[1] * ac[0],
+                        ]
+                    };
+                    let (no, nn) = (crs(&po), crs(&pn));
+                    let lo = (no[0] * no[0] + no[1] * no[1] + no[2] * no[2]).sqrt();
+                    let ln = (nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]).sqrt();
+                    if lo < 1e-18 {
+                        continue; // 原本就退化:无朝向可比,交给薄片清理
+                    }
+                    if ln < 1e-18 || no[0] * nn[0] + no[1] * nn[1] + no[2] * nn[2] < 0.5 * lo * ln {
+                        return false;
+                    }
+                }
+                true
+            }
+            let mut v2t: Vec<Vec<u32>> = vec![Vec::new(); n];
+            for (ti, t) in self.tris.iter().enumerate() {
+                for &vi in t.iter() {
+                    v2t[vi as usize].push(ti as u32);
+                }
+            }
+            let live_tol = 0.5 * adf.size / (1u64 << adf.max_depth) as Real;
             let mut n_snap = 0usize;
             for i in 0..n {
                 if !sharp[i] {
@@ -3484,11 +3553,25 @@ pub mod nets {
                         }
                     }
                 }
-                if best_d2.is_finite() && best_d2 <= lim * lim {
-                    for k in 0..3 {
-                        self.verts[i][k] += (strength * (best_pt[k] - q[k])) as f32;
+                if !(best_d2.is_finite() && best_d2 <= lim * lim) {
+                    continue;
+                }
+                if (adf.eval(best_pt) as Real).abs() > live_tol {
+                    continue; // 该段缘线已被切掉
+                }
+                let mut frac = strength;
+                for _ in 0..4 {
+                    let cand = [
+                        (q[0] + frac * (best_pt[0] - q[0])) as f32 as f64,
+                        (q[1] + frac * (best_pt[1] - q[1])) as f32 as f64,
+                        (q[2] + frac * (best_pt[2] - q[2])) as f32 as f64,
+                    ];
+                    if snap_keeps_orientation(&self.verts, &self.tris, &v2t[i], i, cand) {
+                        self.verts[i] = [cand[0] as f32, cand[1] as f32, cand[2] as f32];
+                        n_snap += 1;
+                        break;
                     }
-                    n_snap += 1;
+                    frac *= 0.5;
                 }
             }
             n_snap
@@ -4170,8 +4253,7 @@ pub mod nets {
                 }
                 // ── 锐边放宽:脊线边(两面二面角 > 25°)用 50×err2 上限。
                 // 合并后的残余偏移由调用方的 snap_sharp_to_rim 拉回原始缘线。
-                let thr = {
-                    let tn = |ti: u32| -> [f64; 3] {
+                let thr = {                    let tn = |ti: u32| -> [f64; 3] {
                         let t = self.tris[ti as usize];
                         let (p0, p1, p2) = (
                             self.verts[t[0] as usize],
@@ -6771,6 +6853,43 @@ mod tests {
     const MIN: [Real; 3] = [-4.0, -4.0, -4.0];
     const SIZE: Real = 8.0;
 
+    /// P23 回归:刀路穿过**深材料粗叶**(需细分 ≥2 层)时,refresh 局部子树的内层
+    /// 索引必须打标。旧版把它们当全局索引,孔壁外整片材料被接成远场空气叶;
+    /// 子索引不越界,tree_index_validator 抓不到 —— 只能对照真值。
+    #[test]
+    fn refresh_deep_subdivision_matches_truth_at_cut_wall() {
+        let mut a = Adf::build(
+            Stock::RoundBox { c: [0.0; 3], half: [8.0; 3], r: 2.0 },
+            [-12.0; 3],
+            24.0,
+            0.005,
+            0.5,
+            8,
+        );
+        a.add_cut(Capsule { a: [-14.0, 0.0, 0.0], b: [14.0, 0.0, 0.0], r: 3.0 });
+        let mut rng = Rng::new(2323);
+        let (mut max_e, mut n_sign) = (0.0f64, 0u32);
+        for _ in 0..4000 {
+            let x = -6.0 + 12.0 * rng.f01();
+            let th = std::f64::consts::TAU * rng.f01();
+            let rr = 3.0 + (rng.f01() - 0.5) * 0.6;
+            let p = [x, rr * th.cos(), rr * th.sin()];
+            let truth = a.true_sd(p);
+            let got = a.eval(p) as Real;
+            max_e = max_e.max((got - truth).abs());
+            if truth.abs() > 0.02 && (got < 0.0) != (truth < 0.0) {
+                n_sign += 1;
+            }
+        }
+        assert_eq!(n_sign, 0, "孔壁邻域出现错号点(refresh 局部索引错接?)max_e={max_e}");
+        assert!(max_e < 0.05, "孔壁邻域 ADF 偏离复合场真值 {max_e} mm");
+        for n in a.nodes.iter() {
+            if let Node::Internal(ch) = n {
+                assert!(ch.iter().all(|&c| (c as usize) < a.nodes.len() && !is_local(c)));
+            }
+        }
+    }
+
     #[test]
     fn certified_far_leaf_cannot_cross_zero_from_a_coarse_bake_sample() {
         let stock = BaseField::Stock(Stock::RoundBox { c: [5.0; 3], half: [1.0; 3], r: 0.0 });
@@ -7031,7 +7150,7 @@ mod tests {
                                         "[dbg]   节点 {ni2} Internal 子 {:?}",
                                         ch.iter().map(|x| *x as usize).collect::<Vec<_>>()
                                     ),
-                                    Node::Leaf(c2) => eprintln!("[dbg]   节点 {ni2} Leaf"),
+                                    Node::Leaf(_c2) => eprintln!("[dbg]   节点 {ni2} Leaf"),
                                 }
                             }
                             panic!("越界");
@@ -7286,7 +7405,7 @@ mod tests {
         for k in 0..4 {
             for j in 0..4 {
                 for i in 0..4 {
-                    let want = ((i as f64 - 1.0).powi(2) + (j as f64 - 1.0).powi(2) + (k as f64 - 1.0).powi(2));
+                    let want = (i as f64 - 1.0).powi(2) + (j as f64 - 1.0).powi(2) + (k as f64 - 1.0).powi(2);
                     let got = d2[(k * n + j) * n + i];
                     assert!(
                         (got - want).abs() < 1e-9,

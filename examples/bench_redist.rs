@@ -29,7 +29,7 @@ fn plane_case(gn: [usize; 3], hf: f32) -> (Vec<f32>, Vec<f64>) {
     (d, truth)
 }
 
-fn stats(got: &[f32], truth: &[f64], hf: f32) -> (f64, f64) {
+fn stats(got: &[f32], truth: &[f64], _hf: f32) -> (f64, f64) {
     let (mut maxdev, mut sum) = (0.0f64, 0.0f64);
     let mut n = 0u64;
     for (g, t) in got.iter().zip(truth.iter()) {

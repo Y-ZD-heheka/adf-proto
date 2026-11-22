@@ -22,3 +22,9 @@ roundtrip.stl
 
 # 分阶段/对照用的临时 STL
 stl_*.stl
+
+# roundtrip 输出与排查用临时 STL(rt_leg_nodec.stl 达 372MB,超 GitHub 单文件上限)
+rt_*.stl
+
+# qa_render.py 生成的对比渲染图
+_qa_render/

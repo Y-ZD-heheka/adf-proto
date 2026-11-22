@@ -3,6 +3,7 @@
 //! 用法: cargo run --release --example diag_field -- <原始.stl> x y z
 
 use adf_proto::*;
+#[allow(unused_imports)]
 use std::time::Instant;
 
 fn main() {

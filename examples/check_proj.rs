@@ -39,7 +39,7 @@ fn main() {
 
     // 逐顶点查带符号距离,取绝对值
     let t1 = Instant::now();
-    let mut devs: Vec<Real> = verts.iter().map(|v| field.signed_distance(*v).abs()).collect();
+    let devs: Vec<Real> = verts.iter().map(|v| field.signed_distance(*v).abs()).collect();
     println!("[check] 顶点采样耗时 {:?}", t1.elapsed());
     // 注意:分位数统计用排序副本;"最差顶点"的索引必须对**未排序** devs,
     // 否则坐标和偏差错配(上一版就是在这里把 0.04mm 的点标成了 1.24mm)
