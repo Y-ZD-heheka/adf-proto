@@ -57,12 +57,33 @@ fn main() {
     let margin = extent * 0.06 + 1.0;
     let min = [amn[0] - margin, amn[1] - margin, amn[2] - margin];
     let size = extent + 2.0 * margin;
-    // 深度上限默认 10;大件(> 200mm)格宽会被钳到 0.2–0.3mm,可设 ADF_MAX_DEPTH=11 让格宽减半
-    // (叶/缓存/提取内存约 ×4)。
-    let depth_cap: u8 = std::env::var("ADF_MAX_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(10).clamp(6, 12);
-    let max_depth = (((size / h_target).log2().ceil()) as u8).clamp(6, depth_cap);
+    // 深度上限(P42 自动,按薄特征):默认 10。只有 h_target 要求的深度被上限截住(格宽 > h_target),且零件
+    // 表面"一格宽内另有一片表面"的面积占比 > 5%(薄壁/窄缝;ADF_THIN_FRAC 可调)时才取 11。依据(P41/P42 实测):
+    // 网格垫子(薄特征 22%)depth 10 → 源点 max 0.226mm、0.47% > 0.05mm,11 → 0.063 / 0.13%;爪子刀(≈12%)
+    // 0.18 → 0.038;花瓶、翅膀(≤ 2%)10 已达标(0.023 / 0.050),升 11 只换来 2–4× 耗时与更大文件。
+    // ADF_MAX_DEPTH 显式指定时优先(叶/缓存/提取内存每级 ×4~8)。
+    let need_depth = ((size / h_target).log2().ceil()) as u8;
+    let depth_cap: u8 = match std::env::var("ADF_MAX_DEPTH").ok().and_then(|v| v.parse::<u8>().ok()).filter(|&d| d > 0) {
+        Some(d) => d.clamp(6, 12),
+        None if need_depth > 10 => {
+            let h10 = size / 1024.0;
+            let frac_max: Real = std::env::var("ADF_THIN_FRAC").ok().and_then(|v| v.parse().ok()).unwrap_or(0.05);
+            let t = Instant::now();
+            let thin = field.thin_fraction(h10, 4000);
+            let cap = if thin > frac_max { 11 } else { 10 };
+            println!(
+                "[depth.auto] 薄特征占比 {:.1}%(探距 {h10:.3}mm,阈值 {:.0}%)→ 上限 {cap} | {:?}",
+                thin * 100.0,
+                frac_max * 100.0,
+                t.elapsed()
+            );
+            cap
+        }
+        None => 10,
+    };
+    let max_depth = need_depth.clamp(6, depth_cap);
     let h_min = size / (1u64 << max_depth) as Real;
-    println!("[domain] 尺寸 {size:.2}mm | depth {max_depth} | h_min {h_min:.4}mm");
+    println!("[domain] 尺寸 {size:.2}mm | 最大边长 {extent:.1}mm | depth {max_depth}(上限 {depth_cap}) | h_min {h_min:.4}mm");
 
     let h_ext = h_min * mult;
     let t = Instant::now();
